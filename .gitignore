@@ -1,0 +1,58 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.python-version
+
+# ---- Testing / coverage ----
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# ---- Type checkers ----
+.mypy_cache/
+.ruff_cache/
+.pytype/
+
+# ---- AgentFlow runtime artifacts (generated, never committed) ----
+# state, events, operations, reviews, worktrees live outside the repo at runtime,
+# but guard against any accidental local ones:
+.agentflow/
+**/state.json
+**/events.jsonl
+operations/
+approvals/
+reviews/
+plan-history/
+raw/
+
+# ---- IDE / editor ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ---- OS ----
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ---- Secrets ----
+.env
+.env.*
+*.pem
+*.key
+secrets.json
