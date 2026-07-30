@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema#",
   "_phase": 0,
-  "_status": "PARTIAL — incremental; Tasks 0.1-0.2 confirmed, 0.3-0.5 pending",
+  "_status": "PARTIAL — incremental; Tasks 0.1-0.3 confirmed, 0.4-0.5 pending",
   "_discipline": "All facts here are backed by real Phase 0 spike runs, not model memory. Spike scripts/raw outputs live outside the repo (control_root). Every value cites its evidence.",
   "_evidence_control_root": "<repo-external temp dir; not committed>",
   "_sanitized": "No tokens, auth files, or sensitive absolute paths are committed; only sanitized command shapes, versions, and output structures.",
@@ -110,5 +110,50 @@
       },
       "_gap_for_agentflow_v1": "MCP-level mandatory confirmation (tool_confirmation gate) is fallback-capable, not required — see gates. The non-adversarial fallback is the convention-based approval flow."
     }
+  },
+
+  "codex": {
+    "_summary": "Codex CLI (codex exec) contract for the Planner adapter — confirmed via Task 0.3 on a tiny sample git repo.",
+    "command": "codex exec",
+    "cli_version": "0.146.0",
+    "auth": "Logged in via ChatGPT (~/.codex). A ~/.codex/.env file injects proxy env vars (HTTP(S)_PROXY/ALL_PROXY=127.0.0.1:7897) automatically — codex does NOT need the Adapter to pass proxy explicitly.",
+    "stdin_prompt_works": {
+      "value": true,
+      "evidence": "prompt piped to stdin (`cat prompt.txt | codex exec ...`); codex reads prompt from stdin when no positional PROMPT arg (or `-`) is given. Piped stdin is appended as a <stdin> block when a prompt arg is also present.",
+      "flag": "no positional PROMPT arg, or `-`"
+    },
+    "read_only_held": {
+      "value": true,
+      "evidence": "ran with `-s read-only`; after the run the sample repo was clean (git status empty), HEAD unchanged (base==head commit), no tracked/untracked changes. Read-only sandbox held.",
+      "flag": "-s read-only (sandbox policy: read-only | workspace-write | danger-full-access)"
+    },
+    "cwd_is_repo": {
+      "value": true,
+      "evidence": "ran with `-C <repo>`; output referenced repo contents (calc.py, README.md). cwd at the repo is how the agent observes files.",
+      "flag": "-C <DIR> / --cd <DIR>"
+    },
+    "output_schema_works": {
+      "value": true,
+      "evidence": "`--output-schema schema.json` constrained the model's final answer to a JSON object matching the schema; verified the emitted result.json parsed and matched required fields.",
+      "flag": "--output-schema <FILE> (path to a JSON Schema file)",
+      "final_message_flag": "-o <FILE> / --output-last-message <FILE> — writes the agent's last message to a separate output file (the operation dir, distinct from cwd and prompt)"
+    },
+    "events_flag": {
+      "value": true,
+      "flag": "--json — emits JSONL events to stdout (thread.started/turn.started/item.completed/turn.completed); turn.completed carries usage incl. reasoning_output_tokens"
+    },
+    "reasoning_effort_high_supported": {
+      "value": true,
+      "evidence": "model_reasoning_effort=high passed with --strict-config returned EXIT=0 (strict-config errors on unrecognized fields/values); an INVALID value ('INSANE') under --strict-config returned EXIT=1. So 'high' is an accepted value, not silently ignored. Default is medium.",
+      "config_key": "model_reasoning_effort",
+      "how_to_set": "-c model_reasoning_effort=\"high\"",
+      "default": "medium",
+      "_note": "reasoning_output_tokens was 0 for the probed model (gpt-5.6-sol) regardless; the config-value acceptance (not token count) is the verified signal."
+    },
+    "working_flags": ["-s read-only", "-C <repo>", "--output-schema <file>", "-o <out_file>", "--json", "-c model_reasoning_effort=\"high\"", "--skip-git-repo-check (when cwd is not a repo)"],
+    "default_model": "gpt-5.6-sol",
+    "default_provider": "openai",
+    "_network_note": "Codex core inference works without explicit proxy (ChatGPT login) but emits a benign 'failed to refresh available models: timeout' diagnostic; with the .codex/.env proxy the same warning persists — it is a model-list-refresh subprocess quirk, not a failure of the actual call.",
+    "_phase4_contract_reminder": "prompt (stdin) / cwd (repo) / output dir are THREE distinct concepts; never concatenate prompt into args or let cwd point at control_root."
   }
 }
