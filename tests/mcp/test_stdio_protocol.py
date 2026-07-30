@@ -230,3 +230,91 @@ def test_uses_official_sdk_framing():
     from mcp.client.session import ClientSession  # noqa: F401
     from mcp.client.stdio import StdioServerParameters, stdio_client  # noqa: F401
     from mcp.server.fastmcp import FastMCP  # noqa: F401
+
+
+# ---------- Task 1.6: 9-tool surface + param schemas -----------------------
+
+#: the exact 9-tool MCP surface (Spec §5.1). Order is the workflow order.
+NINE_TOOLS = [
+    "workflow_status",
+    "workflow_init",
+    "planner_draft_spec",
+    "workflow_approve_spec",
+    "planner_create_plan",
+    "workflow_start_task",
+    "workflow_verify_task",
+    "reviewer_review_task",
+    "workflow_complete_task",
+]
+
+
+@pytest.mark.anyio
+async def test_tools_list_has_all_nine():
+    """The MCP surface is EXACTLY these 9 tools — no more, no less."""
+    async with sdk_session() as session:
+        tools = await session.list_tools()
+    names = sorted(t.name for t in tools.tools)
+    assert names == sorted(NINE_TOOLS), f"unexpected tool surface: {names}"
+    assert len(tools.tools) == 9
+
+
+@pytest.mark.anyio
+async def test_tool_param_schemas():
+    """Lock the input-schema shape of each tool (Spec §5.1). CAS tools carry
+    `expected_revision`. Bodies are deferred to Phase 6, but the signatures
+    must be correct now so callers (and ZCode) see a stable contract."""
+    async with sdk_session() as session:
+        tools = await session.list_tools()
+    by_name = {t.name: t for t in tools.tools}
+
+    def required_props(tool_name):
+        schema = by_name[tool_name].inputSchema or {}
+        return set((schema.get("required") or [])), set((schema.get("properties") or {}).keys())
+
+    # workflow_status: no params
+    req, props = required_props("workflow_status")
+    assert props == set()
+
+    # workflow_init(target_repo, goal, run_id=None)  (run_id optional per Task 1.6)
+    req, props = required_props("workflow_init")
+    assert {"target_repo", "goal"} <= props
+    assert req == {"target_repo", "goal"}
+    assert "run_id" in props  # optional
+
+    # planner_draft_spec(goal, answers=None, expected_revision=None)
+    req, props = required_props("planner_draft_spec")
+    assert {"goal", "answers", "expected_revision"} <= props
+    assert req == {"goal"}
+
+    # CAS tools carry expected_revision as required input where the spec uses CAS
+    # workflow_approve_spec(expected_revision)
+    req, props = required_props("workflow_approve_spec")
+    assert "expected_revision" in props
+    assert req == {"expected_revision"}
+
+    # planner_create_plan(approved_spec_sha256, expected_revision)
+    req, props = required_props("planner_create_plan")
+    assert {"approved_spec_sha256", "expected_revision"} <= props
+    assert req == {"approved_spec_sha256", "expected_revision"}
+
+    # the four task-scoped tools take (task_id, expected_revision)
+    for tool in ["workflow_start_task", "workflow_verify_task",
+                 "reviewer_review_task", "workflow_complete_task"]:
+        req, props = required_props(tool)
+        assert {"task_id", "expected_revision"} <= props, f"{tool} missing params"
+        assert req == {"task_id", "expected_revision"}, f"{tool} CAS/task_id not required"
+
+
+@pytest.mark.anyio
+async def test_other_tools_deferred_to_phase6():
+    """The 8 tools declared in Task 1.6 raise NotImplementedError when called —
+    their BODIES are deferred to Phase 6. (workflow_status is already live from
+    Task 1.5.) Calling them surfaces an error result, not a partial body."""
+    async with sdk_session() as session:
+        # workflow_init with a dummy target — body is not implemented yet
+        res = await session.call_tool(
+            "workflow_init",
+            {"target_repo": "/nonexistent/for/test", "goal": "probe"},
+        )
+    assert res.isError
+
