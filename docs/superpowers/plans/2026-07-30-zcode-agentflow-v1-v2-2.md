@@ -4,7 +4,7 @@
 
 **Goal:** Produce a safe-to-execute plan that implements the Spec v3.1 v1 vertical slice: a single-task run driven from `NEW` to `READY_TO_MERGE` by a real MCP stdio server, with Codex planning, Grok reviewing, and two human gates.
 
-**Architecture:** A Python package `zcode_agentflow` (src layout) exposing 9 MCP tools over FastMCP stdio. An `Engine` holds the workflow logic; a `Store` holds recoverable state. Two lock layers: a **Registry Lock** (`<user_data_root>/.registry.lock`) guards run creation/pointer/run_id allocation across MCP processes; a **Per-Run Lock** (`<control_root>/.agentflow.lock`) guards that run's state. External calls run **between** two short locked transactions: `begin_operation` (checks source-state + CAS, writes RUNNING, advances to the intermediate state with **revision+1**, returns a `lease_token` + `revision_after_begin`, releases the lock) → adapter call (no lock) → `finish_operation`/`fail_operation` (re-lock, verify `operation_id` + `lease_token` + `revision_after_begin`, commit or mark FAILED/UNKNOWN → NEEDS_HUMAN, clear `active_operation_id`). Artifacts are published as **complete logical snapshots** via an immutable generation manifest + single `current.json` pointer; **all** reads go through one `ArtifactResolver` (no direct `control_root/SPEC.md` reads). Three adapters run subprocess calls with raw capture. No code is pre-written production logic — code blocks here are interface contracts, data structures, and key algorithm pseudocode only.
+**Architecture:** A Python package `zcode_agentflow` (src layout) exposing 9 MCP tools over FastMCP stdio. An `Engine` holds the workflow logic; a `Store` holds recoverable state. Two lock layers: a **Registry Lock** (`<user_data_root>/.registry.lock`) guards run creation/pointer/run_id allocation across MCP processes; a **Per-Run Lock** (`<control_root>/.agentflow.lock`) guards that run's state. External calls run **between** two short locked transactions: `begin_operation` (checks source-state + CAS, writes RUNNING, advances to the intermediate state with **revision+1**, returns a `lease_token` + `revision_after_begin`, releases the lock) → adapter call (no lock) → `finish_operation`/`fail_operation` (re-lock, verify `operation_id` + `lease_token` + `revision_after_begin`, commit or mark FAILED/UNKNOWN → NEEDS_HUMAN, clear `active_operation_id`). Artifacts are published as **complete logical snapshots** (Artifact Index mode); `state.json.artifact_generation` is the **sole commit pointer** (no separate `current.json`); **all** reads go through one `ArtifactResolver` (no direct `control_root/SPEC.md` reads). Three adapters run subprocess calls with raw capture. No code is pre-written production logic — code blocks here are interface contracts, data structures, and key algorithm pseudocode only.
 
 **Tech Stack:** Python 3.11+, `mcp` SDK (`FastMCP`, stdio — exact import path from Phase 0 spike), `jsonschema`, `pyyaml`, `portalocker`, `pytest`, `pytest-mock`. Subprocess calls to `codex exec` and `grok -p`. Windows/Git Bash primary; must stay cross-platform (incl. `.bat`/`.cmd` verification commands, with Windows-safe argument quoting).
 
@@ -17,13 +17,30 @@
 
 ---
 
+> **STATUS: APPROVED_FOR_EXECUTION** (after the errata below are applied — they are applied inline in this document). Architecture is approved; no further full-plan review is required. Remaining unknowns are resolved by the Phase 0 Capability Spike in real ZCode/Codex/Grok/Windows environments, not by more paper review.
+
+## Execution Errata (applied to this document per the final convergence review)
+
+The final convergence review approved v2.2's architecture and required only small inline corrections (no v2.3, no redesign). These 8 corrections are applied below and summarized here so an executing agent reading top-down sees the authoritative rules first:
+
+1. **Single commit pointer = `state.json.artifact_generation`.** There is **no** `current.json`. (Old `current.json` wording in Architecture/summary/Appendix D is superseded.)
+2. **READY_TO_MERGE marks `active-run.json` `terminal:true` — it is NOT cleared.** The pointer is replaced/cleared only on: a new run, explicit `abandon`, or explicit `archive`. (Old "clears pointer" wording is superseded.)
+3. **Canonical-bytes infrastructure (`canonical.py`) is implemented in Task 1.1b, BEFORE Task 1.3a** — it is a base module used by pointer/config/store. No second canonicalization rule exists.
+4. **Task 4.0 depends on 2.1 + 2.7 only** (not 5.3); prompt tests use a sample agent context. Reading `resolved-agent-context.md` and passing it to the renderer is an Engine (6.2/6.3) responsibility.
+5. **Registry Lock has one owner pattern:** `with ActiveRunRegistry.locked(user_data_root) as registry:` acquires/releases the lock; `set_pointer_locked`/`clear_pointer_locked`/`mark_terminal_locked` run **inside** that context and never re-acquire the lock. **Task 3.7 owns the `workflow_init` registry critical section + initial pointer write; Task 6.8 does NOT repeat `set_pointer`** — it only adds the READY_TO_MERGE terminal mark and abandon/archive lifecycle.
+6. **`finish_operation` is the sole committer of `state.json`.** `prepare_generation` (renamed from `promote_artifacts`) writes blobs + generation manifest + fills `next_state.artifact_generation`/hashes but does **not** touch `state.json`; the single `os.replace(state.json)` happens inside `finish_operation`.
+7. **Raw schemas forbid authoritative fields** (run_id/base_commit/hashes). Engine injects them from state, then validates the FINAL schema. Task 2.7 therefore checks `raw rejects authoritative fields` + `final uses state base_commit` — not "overwrite-then-verify".
+8. **`abandon`/`archive` are local admin commands, NOT MCP tools.** The MCP surface stays exactly 9 tools.
+
+---
+
 ## v2.2 revision summary (vs v2.1)
 
 Addresses all 4 P0 + 5 P1 from the v2.1 review (a targeted revision, not a rewrite):
 
 - **P0-1** split Task 1.3 to remove forward dependencies: **1.3a** = active-run pointer *primitives* only (read/set/clear, Phase 1); **3.8** = `Store.recover` + pointer recovery integration (Phase 3); **6.8** = `workflow_init`/`READY_TO_MERGE` pointer lifecycle (Phase 6). Phase 1 Exit now claims only that primitives exist.
 - **P0-2** defined the two-phase transaction's revision/lease semantics: `begin` advances to the intermediate state with **revision+1** and returns a `BeginResult(operation_id, lease_token, revision_after_begin, staging_dir, state_snapshot)`; `finish`/`fail` verify `operation_id` + `lease_token` + `expected_revision == revision_after_begin`. Added `fail_operation` / `mark_unknown` + abnormal-path tests so an adapter exception never strands a Run in an intermediate state.
-- **P0-3** artifact generations are now **complete logical snapshots**: each new generation inherits the previous generation's full artifact map and replaces only this operation's changes; a single `current.json` switch is atomic; **all** reads go through one `ArtifactResolver` (no direct root-file reads anywhere).
+- **P0-3** artifact generations are now **complete logical snapshots**: each new generation inherits the previous generation's full artifact map and replaces only this operation's changes; `state.json.artifact_generation` is the **sole commit pointer** (no separate `current.json`); **all** reads go through one `ArtifactResolver` (no direct root-file reads anywhere).
 - **P0-4** added a **Registry Lock** (`<user_data_root>/.registry.lock`) protecting `active-run.json`, run_id allocation, control/worktree path allocation, second-`workflow_init` rejection, and abandon/archive. Per-Run Lock takes over after a run is created.
 - **P1-1** `.bat`/`.cmd` Windows argument quoting: reject unsafe metacharacters (`& | < > ^ % !`), never concatenate program+args into a string, define `%VAR%`/delayed-expansion policy; dedicated quoting tests.
 - **P1-2** program allowlist moved from Markdown to **structured config** (`verification.program_allowlist`); AGENTS.md is context-only.
@@ -316,11 +333,41 @@ def validate_capabilities(config, capabilities_findings) -> None   # see Task 1.
 **Expected:** 6 passed.
 **Commit message:** `feat: production config.yaml + validated config loader (P0-2)`
 
+### Task 1.1b: Canonical-bytes infrastructure (errata: moved BEFORE 1.3a; base module for pointer/config/store)
+
+**Goal:** per the final-convergence errata, `canonical.py` is a base module used by the active-run pointer (1.3a), config, and the Store — so it is implemented here, before 1.3a, to avoid a forward-dependency and to avoid a second canonicalization rule. (Task 2.2 later adds the **full** edge-case test suite; this task ships the primitives + a smoke test.)
+
+**Depends on:** Task 1.1.
+**Files:** `src/zcode_agentflow/canonical.py`, `tests/unit/test_canonical_smoke.py`.
+
+**Tests first (`tests/unit/test_canonical_smoke.py`):** — primitives + a few key cases (full suite in 2.2):
+- `test_canonical_text_single_trailing_newline` — `b"body"` → `b"body\n"`.
+- `test_canonical_json_is_deterministic` — same object ⇒ same bytes (sorted keys, compact separators).
+- `test_write_canonical_json_is_atomic_replace` — file written via tmp+fsync+`os.replace`; concurrent readers never see a partial.
+- `test_sha256_hex_lower` — known vector.
+
+**Implementation requirements:**
+`[CONTRACT]`
+```
+# canonical.py  (primitives here; full edge-case suite in Task 2.2)
+def canonical_text_bytes(raw: bytes) -> bytes      # utf-8 strict decode; \r\n|\r->\n; exactly one trailing \n
+def canonical_json_bytes(obj) -> bytes              # dumps(ensure_ascii=False, sort_keys=True, separators=(",",":")) -> canonical_text_bytes
+def write_canonical_text(path, data) -> None        # tmp+fsync+os.replace
+def write_canonical_json(path, obj) -> None
+def sha256_hex(data: bytes) -> str
+def hash_file(path) -> str                          # sha256_hex(canonical_text_bytes(read_bytes))
+```
+`[PSEUDO]` the **single** canonicalization rule for the whole project lives here. Task 1.3a's `set_pointer` uses `write_canonical_json`; config uses `canonical_json_bytes` for stable comparison; the Store uses `write_canonical_json`/`hash_file`. Task 2.2 keeps the same functions and only adds the exhaustive edge-case tests (no second implementation).
+
+**Verification:** `python -m pytest tests/unit/test_canonical_smoke.py -v`
+**Expected:** 4 passed.
+**Commit message:** `feat: canonical-bytes base module (errata: before pointer/config/store)`
+
 ### Task 1.3a: Active-run pointer primitives (P0-1, P0-4)
 
 **Goal:** the pointer's read/set/clear primitives + a Registry Lock. **Only** primitives here — no `Store.recover`, no `workflow_init` lifecycle (those land in 3.8 and 6.8). This removes the forward-dependency the v2.1 review flagged.
 
-**Depends on:** Task 1.1.
+**Depends on:** Tasks 1.1, 1.1b (canonical, for `write_canonical_json`).
 **Files:** `src/zcode_agentflow/active_run.py`, `src/zcode_agentflow/locks.py` (Registry Lock portion), `tests/unit/test_active_run_primitives.py`.
 
 **Tests first (`tests/unit/test_active_run_primitives.py`):**
@@ -337,19 +384,27 @@ def validate_capabilities(config, capabilities_findings) -> None   # see Task 1.
 # locks.py  (Registry Lock added here; Per-Run Lock added in Task 3.1)
 @contextmanager
 def registry_lock(user_data_root, timeout=30): ...   # portalocker on <user_data_root>/.registry.lock, LOCK_EX, non-reentrant
-# active_run.py
-def read_pointer(user_data_root) -> dict | None
-def set_pointer(user_data_root, run_id, control_root, target_repo_root) -> None   # UNDER registry_lock; atomic
-def clear_pointer(user_data_root) -> None                                          # UNDER registry_lock
-def scan_runs(user_data_root) -> list      # manual recovery tool; no auto-wiring
+# active_run.py  (errata: ONE owner pattern — the lock is acquired ONLY by ActiveRunRegistry.locked();
+#                the *_locked methods assume the caller already holds it and NEVER re-acquire)
+class ActiveRunRegistry:
+    @classmethod
+    @contextmanager
+    def locked(cls, user_data_root, timeout=30): ...   # acquires+releases the Registry Lock; yields ActiveRunRegistry
+    def read_pointer_locked(self) -> dict | None         # read-only; OK without write
+    def assert_new_run_allowed_locked(self) -> None      # raise if a non-terminal pointer exists
+    def set_pointer_locked(self, run_id, control_root, target_repo_root) -> None   # atomic; assumes lock held
+    def mark_terminal_locked(self, run_id) -> None        # set {state:"READY_TO_MERGE", terminal:true}; assumes lock held
+    def clear_pointer_locked(self) -> None                # abandon/archive; assumes lock held
+def read_pointer(user_data_root) -> dict | None   # convenience: opens its own read-only locked context
+def scan_runs(user_data_root) -> list              # manual recovery tool; no auto-wiring
 ```
-`[PSEUDO]` pointer file at `<user_data_root>/active-run.json`. **No** `Store.recover`, **no** `workflow_init`, **no** resume logic in this task — those are 3.8/6.8.
+`[PSEUDO]` pointer file at `<user_data_root>/active-run.json`. **Rule (errata):** ordinary code MUST NOT call `set_pointer`/`clear_pointer`/`mark_terminal` outside a `with ActiveRunRegistry.locked(...)` block; the `*_locked` methods never acquire the lock themselves (prevents non-reentrant self-deadlock). **No** `Store.recover`, **no** `workflow_init`, **no** resume logic in this task — those are 3.8/6.8.
 
 **Verification:** `python -m pytest tests/unit/test_active_run_primitives.py -v`
 **Expected:** 6 passed.
 **Commit message:** `feat: active-run pointer primitives + registry lock (P0-1, P0-4)`
 
-> **Lifecycle integration (NOT in this task):** `workflow_init` writes the pointer (Task 6.8), `READY_TO_MERGE` clears it (Task 6.8), and corrupt-state recovery uses `Store.recover` (Task 3.8).
+> **Lifecycle integration (NOT in this task):** `workflow_init` writes the initial pointer (Task 3.7 owns the registry critical section + initial pointer write; Task 6.8 delegates to it and does NOT repeat the write); `READY_TO_MERGE` marks the pointer `terminal:true` (NOT cleared — Task 6.8); corrupt-state recovery uses `Store.recover` (Task 3.8). The pointer is replaced/cleared only on a new run / explicit `abandon` / explicit `archive`.
 
 ### Task 1.4: validate_capabilities at startup (P1-1, P1-2)
 
@@ -475,12 +530,12 @@ def validate_spec(e); validate_plan(e); validate_review(obj)   # FINAL, post-inj
 **Expected:** all pass.
 **Commit message:** `feat: strict schemas, planner-result wrapper, raw-vs-final split (P0-5, P0-8, §六.9, Prompt §6, parallel P0-4)`
 
-### Task 2.2: Canonical bytes (Review §六.1; Prompt §7)
+### Task 2.2: Canonical bytes — full edge-case suite (Review §六.1; Prompt §7)
 
-**Goal:** one canonicalization used everywhere; hashing over actual written bytes.
+**Goal:** the canonicalization **implementation** already shipped in Task 1.1b (it is a base module). This task adds the **exhaustive** edge-case test suite that locks the single rule down (no second implementation is written here — only tests).
 
-**Depends:** Task 1.1.
-**Files:** `src/zcode_agentflow/canonical.py`, `tests/unit/test_canonical.py`.
+**Depends:** Task 1.1b.
+**Files:** `tests/unit/test_canonical.py` (the full suite; `src/zcode_agentflow/canonical.py` is already created in 1.1b).
 
 **Tests first (`tests/unit/test_canonical.py`):**
 - `test_single_trailing_newline_added` — `b"body"`→`b"body\n"`.
@@ -570,14 +625,16 @@ def is_within(path, base) -> bool; def assert_within(path, base) -> None
 - `test_manifest_has_no_self_hash_field`.
 - `test_hash_roundtrip` — `hash_file(manifest) == stored_sha` (stored in state/sidecar, not the file).
 - `test_inject_for_review`.
+- `test_manifest_does_not_write_authoritative_control_root` (consistency #2) — `manifest.py` only **builds** the manifest dict / produces its canonical bytes; authoritative on-disk persistence is done by the Store's generation commit (Task 3.5), never by `manifest.py` writing `control_root/task-manifest.json` directly.
 
 **Implementation requirements:**
 `[CONTRACT]`
 ```
 def build_manifest(plan_envelope) -> dict      # {plan_sha256, current_task, tasks:[...]}  NO self sha
-def write_manifest(control_root, manifest) -> Path
-def manifest_sha_of(path) -> str
+def manifest_bytes(manifest) -> bytes          # canonical_json_bytes(manifest) -- for the Store to stage
+def manifest_sha_of_bytes(data: bytes) -> str  # sha256 over canonical bytes
 ```
+`[PSEUDO]` (consistency #2) `manifest.py` is a pure builder; it does NOT write any authoritative file. The Engine passes `manifest_bytes(...)` to `finish_operation` as a staged artifact (`changes={"task-manifest.json": manifest_bytes(...)}`), and the Store's `prepare_generation`+commit persists it. This keeps a single artifact-commit path.
 
 **Verification:** `python -m pytest tests/unit/test_manifest.py -v`
 **Expected:** 3 passed.
@@ -632,21 +689,21 @@ def git_path(repo) -> pathlib.Path
 **Files:** extend `src/zcode_agentflow/schemas.py`; `tests/unit/test_context_invariants.py`.
 
 **Tests first (`tests/unit/test_context_invariants.py`):**
-- `test_spec_context_matches_run` — `spec.run_id == state.run_id`, `spec.goal == state.goal`; `status==NEEDS_USER_INPUT ⇔ questions non-empty`; `READY_FOR_SPEC_APPROVAL ⇒ questions empty`.
-- `test_plan_context_matches_run` — `plan.run_id == state.run_id`, `plan.base_commit == state.base_commit` (injected, not Codex's), `plan.plan_version == 1`; the single task has `id == "T001"`, `dependencies == []`.
+- `test_spec_context_matches_run` — FINAL spec: `spec.run_id == state.run_id`, `spec.goal == state.goal`; `status==NEEDS_USER_INPUT ⇔ questions non-empty`; `READY_FOR_SPEC_APPROVAL ⇒ questions empty`.
+- `test_raw_plan_rejects_authoritative_fields` (consistency #1) — the RAW `plan-proposal` schema **rejects** any envelope containing `base_commit`/`run_id`/hashes (the model cannot emit them); there is no "compare Codex's base_commit" step.
+- `test_final_plan_uses_state_base_commit` (consistency #1) — the FINAL `plan-envelope` (engine-assembled) has `base_commit == state.base_commit` (injected), `plan_version == 1`; the single task has `id == "T001"`, `dependencies == []`.
 - `test_declared_files_relative_no_traversal` — all relative, none containing `..`.
 - `test_verification_cwd_relative` — `verification.cwd` relative (resolved under worktree at runtime).
-- `test_verification_program_in_allowlist` — `program` passes the current allowlist (else reject at validation, not at exec).
-- `test_base_commit_must_equal_state` — Codex-supplied `base_commit` ≠ state ⇒ rejected (must be injected by engine).
+- `test_verification_program_in_allowlist` — `program` (executable) in `program_allowlist`; script kinds' interpreter in `interpreter_allowlist` (consistency with P1-3).
 
 **Implementation requirements:**
 `[CONTRACT]`
 ```
 # schemas.py
-def check_spec_context(spec_envelope, *, run_id, goal) -> None
-def check_plan_context(plan_envelope, *, run_id, base_commit, allowlist) -> None
+def check_spec_context(final_spec_envelope, *, run_id, goal) -> None
+def check_plan_context(final_plan_envelope, *, run_id, base_commit, program_allowlist, interpreter_allowlist) -> None
 ```
-`[PSEUDO]` engine injects `run_id`/`goal`/`base_commit`/`plan_version` before validation (mirrors review-hash injection in Spec §4.5); model-supplied values for those fields are ignored/overwritten, then the invariant is checked.
+`[PSEUDO]` (consistency #1, parallel P0-4) the RAW schema forbids authoritative fields entirely; the engine **injects** `run_id`/`goal`/`base_commit`/`plan_version` from state into the FINAL envelope, then validates. There is **no** "overwrite model field then verify it matches" logic — the model never had the field. This mirrors the review-hash injection principle.
 
 **Verification:** `python -m pytest tests/unit/test_context_invariants.py -v`
 **Expected:** 6 passed.
@@ -796,11 +853,19 @@ class Store:
         #     generate lease_token; WRITE a recoverable begin event + state_after snapshot (parallel P0-2);
         #   RETURN BeginResult; RELEASE lock
     def finish_operation(self, *, operation_id, lease_token, expected_revision, next_state,
-                         staged_artifacts, result, promote=True) -> dict
-        # under run_lock: assert active_operation_id==operation_id & hash(lease_token)==state.active_operation_lease
-        #   & expected_revision == state.revision (== revision_after_begin); validate staged artifacts;
-        #   compute hashes over actual bytes; promote (Task 3.5, single state.json commit); append finish event;
-        #   replace state.json (revision+1 to next_state); status COMMITTED; clear active_operation_id+lease; RELEASE lock
+                         staged_artifacts, result) -> dict
+        # SOLE COMMITTER of state.json (errata 4). Under run_lock:
+        #   1. assert active_operation_id==operation_id & hash(lease_token)==state.active_operation_lease
+        #      & expected_revision == state.revision (== revision_after_begin)
+        #   2. validate staged model/result schemas (raw validated by adapter; final validated here post-injection)
+        #   3. prepare_generation(...) (Task 3.5) -- writes blobs+manifest, FILLS next_state.artifact_generation/hashes,
+        #      does NOT touch state.json
+        #   4. write immutable state_after snapshot
+        #   5. append finish event + fsync
+        #   6. SINGLE os.replace(state.json) with next_state (revision+1)  <-- THE ONLY COMMIT POINT
+        #   7. status COMMITTED; clear active_operation_id + lease; RELEASE lock
+        # Crash semantics: crash before step 6 -> old state visible, recover rolls forward from event/state_after;
+        # crash after step 6 before step 7 -> state committed, recover marks op COMMITTED.
     def fail_operation(self, *, operation_id, lease_token, reason) -> dict
         # under run_lock: verify op+lease; status FAILED; state -> NEEDS_HUMAN (revision+1); event; clear active_operation_id
     def mark_unknown(self, *, operation_id, lease_token, reason) -> dict
@@ -822,7 +887,7 @@ class Store:
 **Files:** extend `src/zcode_agentflow/store.py`; create `src/zcode_agentflow/artifacts.py` (generation store + `ArtifactResolver`); `tests/store/test_promotion.py`.
 
 **Tests first (`tests/store/test_promotion.py`):**
-- `test_state_is_the_only_commit_pointer` (parallel P0-1) — `state.json` carries `artifact_generation`; there is **no** separate `current.json` that can diverge. Promotion writes the new generation's blobs + manifest, then **a single atomic `os.replace` of `state.json`** (with the new `artifact_generation` + new hashes) is the commit point.
+- `test_state_is_the_only_commit_pointer` (parallel P0-1, errata) — `state.json` carries `artifact_generation`; there is **no** separate `current.json`. `prepare_generation` writes blobs + manifest + fills `next_state` fields but does **NOT** touch `state.json`; the **single** `os.replace(state.json)` happens in `finish_operation` (Task 3.4).
 - `test_reader_never_observes_new_artifacts_with_old_state` (parallel P0-1) — inject a crash after blobs are written but before `state.json` replace; on resume, `ArtifactResolver(state)` resolves the **old** generation (old SPEC still visible), never a mix. Inject after `state.json` replace ⇒ new generation visible with matching new state.
 - `test_new_generation_inherits_full_snapshot` (P0-3) — after draft(SPEC) → plan(PLAN+manifest) → verify(execution-result) → review(review-result), the current generation's index maps **all** five logical names — not just the latest op's files.
 - `test_generation_replaces_only_changed_artifacts` — plan's generation index copies forward the prior SPEC blob ref unchanged and only swaps PLAN/manifest.
@@ -843,14 +908,13 @@ class ArtifactResolver:
     def read(self, logical_name) -> bytes                # index[name].blob -> blobs/<sha>
     def read_text(self, logical_name) -> str
     def hash_of(self, logical_name) -> str
-# store.py
-def promote_artifacts(*, operation_id, changes: dict[str, bytes], prev_state, next_state) -> None
+# store.py  (errata: prepare_generation does NOT touch state.json; finish_operation is the sole committer)
+def prepare_generation(*, operation_id, changes: dict[str, bytes], prev_state, next_state) -> Generation
     # 1. build new index = copy of current generation's index (inherit ALL names)
     # 2. for each (name, bytes) in changes: write blobs/<sha> (content-addressed); set index[name] = {blob, sha256}
-    # 3. write artifacts/<operation_id>/manifest.json (the new Generation) -- NOT yet committed
-    # 4. set next_state.artifact_generation = operation_id; next_state.*_sha256 = index[name].sha256
-    # 5. SINGLE atomic os.replace(state.json) with next_state  <-- THE ONLY COMMIT POINT (parallel P0-1)
-    # (no separate current.json switch; state IS the pointer)
+    # 3. write artifacts/<operation_id>/manifest.json (the new Generation) -- NOT yet committed (state.json untouched)
+    # 4. fill next_state fields ONLY: next_state.artifact_generation = operation_id; next_state.*_sha256 = index[name].sha256
+    # 5. return Generation -- DOES NOT os.replace(state.json); finish_operation does that (single commit point)
 ```
 `[DATA]` generation manifest (Artifact Index) shape:
 ```json
@@ -911,11 +975,11 @@ def preflight(*, target_repo, control_root, worktree_root, branch) -> None
     # git available; target_repo is git repo; HEAD exists; no MERGE_HEAD/REBASE_HEAD/CHERRY_PICK_HEAD;
     # branch/worktree don't collide (gitops.branch_exists/worktree_list); roots non-nesting; Windows path usable
 ```
-`[PSEUDO]` init runs **under the Registry Lock** (`registry_lock(user_data_root)`) for the run-creation critical section: preflight → allocate run_id/control/worktree (Task 1.3a primitives) → check no active non-terminal pointer (else reject unless `abandon`) → `begin_operation` (Per-Run lock; replay_policy=UNSAFE_WRITE with dedicated recovery) → `gitops.create_worktree` (journal branch) → `finish_operation(next_state=INITIALIZING_WORKTREE, base_commit)` → `set_pointer(...)` → release Registry Lock. Recovery (Task 3.8) consults journal + `gitops.worktree_list`; **no destructive cleanup**.
+`[PSEUDO]` init owns the run-creation critical section inside **one** `with ActiveRunRegistry.locked(user_data_root) as registry:` block (errata: this task is the SOLE owner of the init pointer write; Task 6.8 delegates here and does NOT repeat it): `registry.assert_new_run_allowed_locked()` → preflight → allocate run_id/control/worktree → `begin_operation` (Per-Run lock; replay_policy=UNSAFE_WRITE with dedicated recovery) → `gitops.create_worktree` (journal branch) → `finish_operation(next_state=INITIALIZING_WORKTREE, base_commit)` → `registry.set_pointer_locked(...)` → exit the `with` (releases Registry Lock). The `*_locked` calls assume the lock is already held and never re-acquire it. Recovery (Task 3.8) consults journal + `gitops.worktree_list`; **no destructive cleanup**.
 
 **Verification:** `python -m pytest tests/unit/test_workflow_init_recovery.py -v`
 **Expected:** 5 passed.
-**Commit message:** `feat: transactional workflow_init + preflight + registry-locked run creation (Prompt §11, P0-4)`
+**Commit message:** `feat: transactional workflow_init + preflight + registry-locked run creation (Prompt §11, P0-4, errata)`
 
 ### Task 3.8: Store.recover + active-pointer recovery integration (P0-1, P0-2)
 
@@ -970,7 +1034,7 @@ def resume_active_run(user_data_root) -> RunPaths | None
 
 **Goal:** create + test the three prompt files the adapters/engine render. Resolves the v2-review gap where prompts had no task. Use an **explicit `{{ var }}` placeholder syntax** with a per-template variable set (parallel P1-5: a generic "no `{...}` after render" rule false-positives on JSON examples/code braces in the prompt body). The resolved agent context is **inlined into the prompt sent via stdin** (parallel P1-2: Codex's cwd is the worktree under a read-only sandbox, so an external `control_root/resolved-agent-context.md` path may be unreadable).
 
-**Depends:** Tasks 2.1 (schema names), 2.7 (context invariants), 5.3 (resolved agent context).
+**Depends:** Tasks 2.1 (schema names), 2.7 (context invariants). (Errata: does NOT depend on 5.3 — prompt template tests use a **sample** agent context string. Reading `resolved-agent-context.md` and passing it as the `agent_context` render field is an Engine responsibility in 6.2/6.3.)
 **Files:** `prompts/planner-draft.md`, `prompts/planner-plan.md`, `prompts/reviewer.md`, `src/zcode_agentflow/prompts.py`, `tests/unit/test_prompts.py`.
 
 **Tests first (`tests/unit/test_prompts.py`):**
@@ -1407,15 +1471,18 @@ def workflow_verify_task(self, task_id, expected_revision) -> dict
 - `test_review_fail_routes_to_needs_human`.
 - `test_hashes_injected_from_state_not_trusted`.
 - `test_bundle_assembled_before_call` — all 7 files in staging.
-- `test_head_and_clean_rechecked`.
+- `test_head_bound_to_execution_result_before_review` (consistency #3) — before review, the engine asserts `HEAD == execution_result.head_commit` (and `HEAD == state.verified_head_commit`); `last_reviewed_commit` is **not** used pre-review (it's set only after a successful review).
+- `test_last_reviewed_commit_set_after_review` (consistency #3) — after a PASS review, `state.last_reviewed_commit = review_result.head_commit`.
 
 **Implementation requirements:**
 `[CONTRACT]`
 ```
 def reviewer_review_task(self, task_id, expected_revision) -> dict
-    # verify_locked_artifacts; assert clean + HEAD == last_reviewed_commit
+    # verify_locked_artifacts; assert worktree clean + HEAD == execution_result.head_commit + HEAD == state.verified_head_commit
+    #   (consistency #3: do NOT assert against last_reviewed_commit pre-review)
     # review_bundle.assemble in staging; GrokAdapter.invoke [no lock]; validate_review (injected hashes)
     # staged review-result promoted via finish_operation; decision != PASS -> NEEDS_HUMAN
+    # on PASS: state.last_reviewed_commit = review_result.head_commit
 ```
 
 **Verification:** `python -m pytest tests/unit/test_engine_review.py -v`
@@ -1446,7 +1513,7 @@ def workflow_complete_task(self, task_id, expected_revision) -> dict
     #   resolver.hash_of("SPEC.md")==state.spec_sha256, resolver.hash_of("PLAN.md")==state.plan_sha256,
     #   resolver.hash_of("task-manifest.json")==state.task_manifest_sha256,
     #   review_hashes==state, cas, head!=task_start_commit, changed_files_as_expected
-    # all -> READY_TO_MERGE (Task 6.8 then clears the active-run pointer); NO merge, NO push
+    # all -> READY_TO_MERGE (Task 6.8 then marks the active-run pointer terminal:true, NOT cleared); NO merge, NO push
 ```
 
 **Verification:** `python -m pytest tests/unit/test_engine_complete.py -v`
@@ -1478,36 +1545,38 @@ def workflow_complete_task(self, task_id, expected_revision) -> dict
 
 ### Task 6.8: Active-run pointer lifecycle (workflow_init / READY_TO_MERGE) (P0-1)
 
-**Goal:** the lifecycle half v2.1's Task 1.3 wrongly bundled into Phase 1. Wire the Task 1.3a primitives into `workflow_init` (set pointer) and `workflow_complete_task`→`READY_TO_MERGE` (clear/archive pointer), and enforce single-active-run under the Registry Lock.
+**Goal:** the lifecycle half v2.1's Task 1.3 wrongly bundled into Phase 1. Add the READY_TO_MERGE terminal-mark and abandon/archive lifecycle on top of the Task 1.3a primitives and the Task 3.7 init critical section. (Per errata: `workflow_init`'s pointer write is owned by Task 3.7; this task does **not** repeat it — it only marks terminal on READY_TO_MERGE and provides abandon/archive.)
 
 **Depends:** Tasks 6.2 (workflow_init engine path), 6.6 (complete→READY_TO_MERGE), 3.7 (init_run), 1.3a, 3.8.
 **Files:** extend `src/zcode_agentflow/engine.py`; `tests/unit/test_pointer_lifecycle.py`.
 
 **Tests first (`tests/unit/test_pointer_lifecycle.py`):**
-- `test_workflow_init_sets_pointer_under_registry_lock` — `workflow_init` calls `set_pointer` under the Registry Lock (Task 1.3a); after init, `read_pointer` returns the new run.
-- `test_second_init_rejected_while_active_non_terminal` — a non-terminal active pointer ⇒ second `workflow_init` rejected unless explicit `abandon` (which itself clears the pointer under the Registry Lock).
-- `test_ready_to_merge_marks_pointer_terminal_not_cleared` (parallel P0-3) — reaching `READY_TO_MERGE` via `workflow_complete_task` updates the pointer to `{run_id, state:"READY_TO_MERGE", terminal:true}` under the Registry Lock; it is **not** cleared. Afterward `workflow_status` still resolves this run and returns the READY_TO_MERGE handoff (the v2.1 "clear on terminal" bug made `workflow_status` return `{active_run:null}` and lost the final result).
-- `test_terminal_pointer_allows_new_run` — a `terminal:true` pointer does **not** block a new `workflow_init` (only non-terminal does); the new init overwrites the pointer under the Registry Lock.
-- `test_abandon_clears_pointer_and_allows_new_run` — explicit `abandon` clears the pointer so a new run can start.
-- `test_pointer_only_mutated_under_registry_lock` — instrument the Registry Lock to assert every `set_pointer`/`clear_pointer`/terminal-mark call occurs while it is held.
+- `test_workflow_init_delegates_pointer_write_to_init_run` (errata) — `workflow_init` delegates to `init_run` (Task 3.7), which owns the registry critical section + initial `set_pointer_locked`; `workflow_init` does **not** call `set_pointer` itself (no double write).
+- `test_second_init_rejected_while_active_non_terminal` — a non-terminal active pointer ⇒ second `workflow_init` rejected unless the prior run was abandoned (`assert_new_run_allowed_locked` raises).
+- `test_ready_to_merge_marks_pointer_terminal_not_cleared` (parallel P0-3) — reaching `READY_TO_MERGE` via `workflow_complete_task` calls `mark_terminal_locked` inside `ActiveRunRegistry.locked`; pointer becomes `{run_id, state:"READY_TO_MERGE", terminal:true}`, **not** cleared. Afterward `workflow_status` still resolves this run and returns the READY_TO_MERGE handoff.
+- `test_terminal_pointer_allows_new_run` — a `terminal:true` pointer does **not** block a new `workflow_init`; the new init's `set_pointer_locked` overwrites it.
+- `test_abandon_is_local_admin_not_mcp_tool` (consistency #4) — `abandon`/`archive` are invoked via a local admin command (`zcode-agentflow admin abandon --run-id <id>`), NOT registered as MCP tools; the MCP surface stays exactly 9.
+- `test_pointer_mutations_only_inside_locked_context` — instrument to assert every `set_pointer_locked`/`mark_terminal_locked`/`clear_pointer_locked` call occurs inside a `with ActiveRunRegistry.locked(...)` block and never re-acquires the lock.
 
 **Implementation requirements:**
 `[CONTRACT]`
 ```
-# active_run.py (extend Task 1.3a primitives)
-def mark_pointer_terminal(user_data_root, run_id) -> None   # UNDER registry_lock; set {run_id, state:"READY_TO_MERGE", terminal:true}
-# engine.py
+# engine.py  (errata: workflow_init does NOT write the pointer; init_run (3.7) does)
 def workflow_init(self, target_repo, goal, run_id=None) -> dict
-    # ... init_run (Task 3.7) ... then set_pointer(user_data_root, run_id, control_root, target_repo_root) under registry_lock
+    # delegates to store.init_run (Task 3.7), which owns the ActiveRunRegistry.locked critical section + initial set_pointer_locked
 def workflow_complete_task(self, task_id, expected_revision) -> dict
-    # ... on reaching READY_TO_MERGE: mark_pointer_terminal(user_data_root, run_id) under registry_lock (NOT clear)
-def abandon_run(self, run_id) -> dict     # explicit abandon: clear_pointer under registry_lock; allows a new init
+    # ... on reaching READY_TO_MERGE:
+    with ActiveRunRegistry.locked(user_data_root) as registry:
+        registry.mark_terminal_locked(run_id)   # NOT clear
+# admin (LOCAL command, NOT an MCP tool — consistency #4)
+def abandon_run(run_id) -> None    # zcode-agentflow admin abandon; inside ActiveRunRegistry.locked -> clear_pointer_locked
+def archive_run(run_id) -> None    # zcode-agentflow admin archive; inside ActiveRunRegistry.locked
 ```
-`[PSEUDO]` the pointer is the **only** source of "which run is active"; lifecycle mutations happen under the Registry Lock (P0-4). A terminal pointer is retained so `workflow_status`/handoff can still read the final result; it is cleared only on new init / abandon / archive (parallel P0-3). Recovery of the pointer's run on restart is Task 3.8.
+`[PSEUDO]` the pointer is the **only** source of "which run is active"; all writes go through `ActiveRunRegistry.locked` + `*_locked` methods (errata: single owner pattern, no nested lock). A terminal pointer is retained so `workflow_status`/handoff can read the final result; it is cleared only on new init / abandon / archive (parallel P0-3). `abandon`/`archive` are local admin commands, not MCP tools (consistency #4). Recovery of the pointer's run on restart is Task 3.8.
 
 **Verification:** `python -m pytest tests/unit/test_pointer_lifecycle.py -v`
 **Expected:** 6 passed.
-**Commit message:** `feat: active-run pointer lifecycle — terminal-mark (not clear) on READY_TO_MERGE (P0-1, P0-4, parallel P0-3)`
+**Commit message:** `feat: pointer lifecycle — terminal-mark, init delegates to init_run, abandon as local admin (errata, P0-1/P0-4, parallel P0-3, consistency #4)`
 
 ---
 
@@ -1756,7 +1825,7 @@ Phases are in **true topological order** (P0-6); an executing agent may proceed 
 |---|---|---|
 | P0-1 Task 1.3 forward-depends on Phase 3/6 (not topological) | P0 | split: **1.3a** (pointer primitives only) + **3.8** (Store.recover + pointer recovery) + **6.8** (workflow_init/READY_TO_MERGE lifecycle); Phase 1 Exit claims only primitives |
 | P0-2 two-phase revision/lease semantics undefined; no fail/unknown path | P0 | **3.4** `BeginResult(lease_token, revision_after_begin)` + begin does revision+1; `finish`/`fail` verify lease+revision; **3.4** `fail_operation`/`mark_unknown` + abnormal-path tests (incl. orphan active op on crash → recover) |
-| P0-3 generation pointer isn't a complete snapshot; dual read paths | P0 | **3.5** complete logical snapshots (inherit prior map, replace only changes) + single `current.json` switch + **ArtifactResolver** as the only read path (6.1/6.2/6.3/6.6/4.3 all route through it) |
+| P0-3 generation pointer isn't a complete snapshot; dual read paths | P0 | **3.5** complete logical snapshots (inherit prior map, replace only changes) + `state.json.artifact_generation` as sole commit pointer (no `current.json`) + **ArtifactResolver** as the only read path (6.1/6.2/6.3/6.6/4.3 all route through it) |
 | P0-4 active-run pointer has no Registry Lock (concurrent double-init) | P0 | **1.3a** Registry Lock (`<user_data_root>/.registry.lock`); **3.7** init holds it for run creation; **6.8** lifecycle mutations under it |
 | P1-1 `.bat`/`.cmd` parameter injection | P1 | **4.4** reject `& \| < > ^ % !`, never concatenate, define `%VAR%`/delayed-expansion policy, `test_cmd_quoting.py` |
 | P1-2 allowlist parsed from Markdown | P1 | **4.4** + **1.2** structured `verification.program_allowlist`; AGENTS.md context-only |
