@@ -45,6 +45,8 @@ __all__ = [
     "validate_spec",
     "validate_plan",
     "validate_review",
+    "check_spec_context",
+    "check_plan_context",
 ]
 
 # schemas/ lives at the repo root (the future plugin_root); it is a committed
@@ -233,3 +235,164 @@ def validate_review(obj: dict) -> None:
     re-check the structural decision invariants on the assembled envelope."""
     validate_against(obj, "review-result")
     _check_decision_invariants(obj)
+
+
+# ===========================================================================
+# Task 2.7 — context invariants (P1-3).
+#
+# These run AFTER the structural FINAL validator. They enforce that a FINAL
+# envelope is consistent with the CURRENT RUN: the engine-injected authoritative
+# fields (run_id / goal / base_commit / plan_version) must equal the state
+# values, the single task is T001 with empty dependencies, paths are relative
+# and traversal-free, and verification programs/interpreters are allowlisted.
+#
+# parallel P0-4 / consistency #1: there is NO "overwrite model field then verify
+# it matches" — the model never had the authoritative fields (the RAW schema
+# forbids them), so the engine injects them from state and these checks confirm
+# the FINAL envelope carries exactly the state values.
+# ===========================================================================
+
+
+def check_spec_context(final_spec_envelope: dict, *, run_id: str, goal: str) -> None:
+    """Validate the FINAL spec-envelope structurally, then enforce run-context.
+
+      - run_id: ``spec.run_id == state.run_id`` (engine-injected)
+      - goal:   ``spec.goal == state.goal`` (echoed from the run)
+      - status/questions: NEEDS_USER_INPUT <=> questions non-empty;
+        READY_FOR_SPEC_APPROVAL => questions empty.
+    """
+    validate_spec(final_spec_envelope)  # structural first
+    if final_spec_envelope["run_id"] != run_id:
+        raise SchemaError(
+            f"spec run_id mismatch: envelope has {final_spec_envelope['run_id']!r}, "
+            f"state has {run_id!r}"
+        )
+    if final_spec_envelope["goal"] != goal:
+        raise SchemaError(
+            f"spec goal mismatch: envelope has {final_spec_envelope['goal']!r}, "
+            f"state has {goal!r}"
+        )
+    status = final_spec_envelope["status"]
+    questions = final_spec_envelope.get("questions", [])
+    if status == "NEEDS_USER_INPUT":
+        if not questions:
+            raise SchemaError(
+                "status=NEEDS_USER_INPUT requires non-empty questions"
+            )
+    elif status == "READY_FOR_SPEC_APPROVAL":
+        if questions:
+            raise SchemaError(
+                "status=READY_FOR_SPEC_APPROVAL requires empty questions"
+            )
+
+
+# script kind -> the interpreters that may run it (any one allowlisted suffices).
+# cmd_script runs under cmd.exe/powershell; bash_script under bash/sh. executable
+# runs the program directly (interpreter_allowlist is not consulted).
+_SCRIPT_INTERPRETERS = {
+    "cmd_script": {"cmd.exe", "cmd", "powershell", "powershell.exe"},
+    "bash_script": {"bash", "sh", "bash.exe", "sh.exe"},
+}
+
+
+def check_plan_context(
+    final_plan_envelope: dict,
+    *,
+    run_id: str,
+    base_commit: str,
+    program_allowlist,
+    interpreter_allowlist,
+) -> None:
+    """Validate the FINAL plan-envelope structurally, then enforce run-context.
+
+    Authoritative fields (engine-injected from state):
+      - run_id == state.run_id
+      - base_commit == state.base_commit
+      - plan_version == 1 (v1 starts here; replans are v1.2)
+    Single-task shape:
+      - exactly one task with id == "T001" and dependencies == []
+    Path safety (resolved under run_worktree_root at runtime):
+      - every declared_files entry is relative and contains no '..'
+      - every verification_commands[].cwd is relative and contains no '..'
+    Allowlists (P1-2 structured config, NOT AGENTS.md text):
+      - kind=executable   => program in program_allowlist
+      - kind=cmd_script/  => its interpreter is in interpreter_allowlist
+        bash_script
+    """
+    validate_plan(final_plan_envelope)  # structural first
+
+    if final_plan_envelope["run_id"] != run_id:
+        raise SchemaError(
+            f"plan run_id mismatch: envelope has {final_plan_envelope['run_id']!r}, "
+            f"state has {run_id!r}"
+        )
+    if final_plan_envelope["base_commit"] != base_commit:
+        raise SchemaError(
+            f"plan base_commit mismatch: envelope has "
+            f"{final_plan_envelope['base_commit']!r}, state has {base_commit!r}"
+        )
+    if final_plan_envelope["plan_version"] != 1:
+        raise SchemaError(
+            f"v1 plan_version must be 1; envelope has "
+            f"{final_plan_envelope['plan_version']!r}"
+        )
+
+    tasks = final_plan_envelope["tasks"]
+    # structural schema already guarantees len(tasks)==1
+    task = tasks[0]
+    if task["id"] != "T001":
+        raise SchemaError(
+            f"v1 single task must be T001; envelope task id is {task['id']!r}"
+        )
+    if task.get("dependencies"):
+        raise SchemaError(
+            f"v1 single task must have empty dependencies; got {task['dependencies']!r}"
+        )
+
+    program_set = set(program_allowlist or [])
+    interpreter_set = set(interpreter_allowlist or [])
+
+    # declared_files: relative + no traversal
+    for f in task.get("declared_files", []):
+        _assert_relative_no_traversal(f, what="declared_files entry")
+
+    # verification_commands: relative cwd + no traversal + allowlist
+    for cmd in task.get("verification_commands", []):
+        _assert_relative_no_traversal(cmd["cwd"], what="verification cwd")
+        kind = cmd["kind"]
+        program = cmd["program"]
+        if kind == "executable":
+            if program not in program_set:
+                raise SchemaError(
+                    f"verification program {program!r} is not in the "
+                    f"program_allowlist (allowed: {sorted(program_set)})"
+                )
+        elif kind in _SCRIPT_INTERPRETERS:
+            allowed = _SCRIPT_INTERPRETERS[kind]
+            if not (allowed & interpreter_set):
+                raise SchemaError(
+                    f"verification script kind {kind!r} for program {program!r} "
+                    f"requires one of {sorted(allowed)} in interpreter_allowlist "
+                    f"(got {sorted(interpreter_set)})"
+                )
+
+
+def _assert_relative_no_traversal(path: str, *, what: str) -> None:
+    """A path used under run_worktree_root must be relative and contain no '..'
+    component (no escape via a crafted declared path or cwd).
+
+    Host-platform-independent: we test the path against BOTH a POSIX and a
+    Windows flavor and reject if EITHER treats it as absolute or anchored. This
+    way a Windows-style absolute path (``C:/x``) is rejected even when the
+    process runs on POSIX, and a POSIX absolute (``/x``) is rejected on Windows.
+    ``PurePath`` is platform-flavored, so using it alone would be wrong off-host.
+    """
+    if not path:
+        raise SchemaError(f"{what} must not be empty")
+    from pathlib import PurePosixPath, PureWindowsPath
+
+    for flavor in (PurePosixPath(path), PureWindowsPath(path)):
+        if flavor.is_absolute() or flavor.anchor:
+            raise SchemaError(f"{what} must be relative (got absolute {path!r})")
+        if any(part == ".." for part in flavor.parts):
+            raise SchemaError(f"{what} must not contain '..' (got {path!r})")
