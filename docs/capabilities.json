@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema#",
   "_phase": 0,
-  "_status": "PARTIAL — incremental; Tasks 0.1 confirmed, 0.2-0.5 pending",
+  "_status": "PARTIAL — incremental; Tasks 0.1-0.2 confirmed, 0.3-0.5 pending",
   "_discipline": "All facts here are backed by real Phase 0 spike runs, not model memory. Spike scripts/raw outputs live outside the repo (control_root). Every value cites its evidence.",
   "_evidence_control_root": "<repo-external temp dir; not committed>",
   "_sanitized": "No tokens, auth files, or sensitive absolute paths are committed; only sanitized command shapes, versions, and output structures.",
@@ -59,6 +59,56 @@
       "evidence": "In a real interactive ZCode session, PreToolUse/PostToolUse hooks captured tool_name='mcp__echo-spike__echo' with tool_input={text:'hello'} and toolResponse.content[0].text='{\"echo\": \"hello\"}', isError=false.",
       "tool_naming_convention": "mcp__<server>__<tool>",
       "input_schema_source": "Pydantic-generated from the @mcp_server.tool() function signature"
+    },
+
+    "hooks": {
+      "_summary": "Real ZCode hook contract — captured by a temp hook-dumper process hook firing on all 7 events, registered via ~/.zcode/cli/config.json -> hooks (enabled:true). Config-file hooks require hooks.enabled:true.",
+      "events_total": 7,
+      "events_supported": ["SessionStart", "UserPromptSubmit", "PreToolUse", "PermissionRequest", "PostToolUse", "PostToolUseFailure", "Stop"],
+      "events_observed_real": {
+        "SessionStart": {"value": true, "source_values_seen": ["startup"]},
+        "UserPromptSubmit": {"value": true, "match_value": "the prompt text"},
+        "PreToolUse": {"value": true, "match_value": "tool name", "extra_fields": ["riskLevel", "sideEffectScope"]},
+        "PostToolUse": {"value": true, "match_value": "tool name", "extra_fields": ["toolResponse", "toolResultPreview"]},
+        "Stop": {"value": true, "extra_fields": ["stopHookActive", "toolCallCount", "responsePreview"]},
+        "PermissionRequest": {"value": "event_confirmed", "raw_payload_captured": false, "_gap": "Event existence confirmed by authoritative hook docs + same-source stdin structure as other tool events; real stdin payload NOT captured because ZCode's hook runner runs in the interactive main session while this probe executed in an exec sub-session that has no hook runner. Under yolo/bypass mode the event does not fire at all."},
+        "PostToolUseFailure": {"value": "not_observed", "_note": "no failing tool call was triggered during the spike; event is supported per docs."}
+      },
+      "stdin_shape": {
+        "key_casing": "DUAL — every field provided in BOTH snake_case and camelCase (e.g. hook_event_name/hookEventName, tool_name/toolName, tool_input/toolInput, session_id/sessionId, transcript_path/transcriptPath)",
+        "common_fields_all_events": ["cwd", "hook_event_name", "hookEventName", "mode", "permission_mode", "sessionId", "session_id", "timestamp", "traceId", "transcriptPath", "transcript_path", "turnId"],
+        "tool_event_extra_fields": ["tool_name/toolName", "tool_input/toolInput", "toolCallId", "tool_use_id", "riskLevel", "sideEffectScope"]
+      },
+      "hook_cwd": "the project root (e.g. the open repo), NOT the plugin/control root. Plugin root reachable via env var ZCODE_PROJECT_DIR / CLAUDE_PROJECT_DIR.",
+      "exit_code_denies": {"0": "pass", "2": "block/deny for PreToolUse/PermissionRequest", "other_nonzero": "error"},
+      "feedback_channel": "stdout parsed as strict JSON (any extra key fails validation); exit codes as alternative. additionalContext injected into conversation; PreToolUse may return allow/ask/deny; Stop may request continuation.",
+      "stop_reentry_limit": "Stop may request continuation up to 3 times (controlled by stopHookActive field).",
+      "matcher_is_regex": true,
+      "matcher_case_sensitive": true,
+      "tool_aliases": {"Task": "Agent", "Write/Edit": "ApplyPatch"},
+      "template_vars": ["${ZCODE_PROJECT_DIR}", "${CLAUDE_PROJECT_DIR}", "${ZCODE_SESSION_ID}", "${CLAUDE_SESSION_ID}", "${ZCODE_PLUGIN_ROOT} (plugin hooks only)"],
+      "process_hook_fields": ["command", "args", "timeoutMs"],
+      "command_hook_fields": ["command", "shell", "timeout", "timeoutMs"],
+      "timeout_resolution_order": "timeoutMs -> timeout*1000 -> config timeoutMs -> default 60000ms"
+    },
+
+    "tool_confirmation": {
+      "_summary": "Whether ZCode supports AND how to configure MCP tool-level mandatory human confirmation.",
+      "supported": true,
+      "mechanism": "NOT a per-tool GUI switch. It is permissions.defaultMode + allow/deny rules in ~/.claude/settings.json (Claude-Code-compatible).",
+      "config_field": "permissions.defaultMode",
+      "config_file": "~/.claude/settings.json",
+      "scope": "global (defaultMode) + per-tool (allow/deny rules like 'Bash(awk:*)')",
+      "modes_observed": {
+        "yolo": {"internal_value": "yolo", "settings_value": "bypassPermissions", "gui_label": "完全访问 / full access", "behavior": "no confirmation prompts; PermissionRequest hook does NOT fire"},
+        "confirm_on_change": {"gui_label": "变更前确认", "behavior": "prompts before write/side-effecting tool calls; GUI dialog with 3 options"}
+      },
+      "confirmation_dialog": {
+        "title": "需要权限 / 等待确认",
+        "options": ["允许 仅允许这一次", "始终允许本项目 (后续相同命令不再询问)", "拒绝 这次先拒绝"],
+        "can_input_feedback": "not observed (dialog is option-selection based)"
+      },
+      "_gap_for_agentflow_v1": "MCP-level mandatory confirmation (tool_confirmation gate) is fallback-capable, not required — see gates. The non-adversarial fallback is the convention-based approval flow."
     }
   }
 }
