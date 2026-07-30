@@ -544,8 +544,10 @@ class Store:
         the transition. Then mark the op COMMITTED and clear the active op.
 
         ``staged_artifacts`` (a {logical_name: bytes} map) is consumed by
-        Task 3.5's prepare_generation; here it is accepted and (for this task)
-        only persisted as the operation's result material if provided.
+        :func:`artifacts.prepare_generation` (Task 3.5): it writes blobs + the
+        new generation manifest and FILLS ``state.artifact_generation`` /
+        per-artifact shas WITHOUT touching state.json — the single
+        ``os.replace(state.json)`` below remains the only commit point (errata #6).
         """
         from zcode_agentflow import locks as _locks
 
@@ -573,9 +575,20 @@ class Store:
             if result is not None:
                 op.write_result(result)
 
-            # prepare_generation (Task 3.5) is plugged in here in 3.5; for now,
-            # staged_artifacts is accepted but only the result is recorded. The
-            # single commit point is the state.json replace below.
+            # prepare_generation (Task 3.5): write blobs + the new generation
+            # manifest and FILL state.artifact_generation / per-artifact shas.
+            # This does NOT touch state.json — the single os.replace below is the
+            # only commit point (errata #6). staged_artifacts may be empty.
+            from zcode_agentflow import artifacts as _artifacts
+
+            if staged_artifacts:
+                _artifacts.prepare_generation(
+                    control_root=self.control_root,
+                    operation_id=operation_id,
+                    changes=staged_artifacts,
+                    prev_state=State.load(self.control_root),
+                    next_state=state,
+                )
             snap_rel, snap_sha = op.write_state_snapshot(
                 "state_after", state.to_dict()
             )
@@ -845,6 +858,11 @@ class State:
     artifact_generation: str | None = None
     active_operation_id: str | None = None
     active_operation_lease: str | None = None
+    # Task 3.5: per-artifact authoritative shas for the execution-result and
+    # review-result logical names (used by the review/handoff binding). Optional
+    # so a State created before those artifacts exist round-trips without them.
+    execution_result_sha256: str | None = None
+    review_result_sha256: str | None = None
 
     # ---- persistence -----------------------------------------------------
 
@@ -878,6 +896,8 @@ class State:
             "artifact_generation",
             "active_operation_id",
             "active_operation_lease",
+            "execution_result_sha256",
+            "review_result_sha256",
         ):
             v = getattr(self, k)
             if v is not None:
@@ -943,4 +963,6 @@ class State:
             artifact_generation=d.get("artifact_generation"),
             active_operation_id=d.get("active_operation_id"),
             active_operation_lease=d.get("active_operation_lease"),
+            execution_result_sha256=d.get("execution_result_sha256"),
+            review_result_sha256=d.get("review_result_sha256"),
         )
