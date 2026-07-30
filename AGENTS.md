@@ -86,7 +86,7 @@ ZCode / Codex CLI / Grok CLI / MCP SDK 的真实 flag、字段、payload、退�
 
 | # | 陷阱 | 说明 / 处理 |
 |---|---|---|
-| G1 | **`.gitignore` 的 `prompts/` 规则过宽** | 第 61 行 `prompts/` 会同时吞掉运行时插件的 `prompts/` 和 **`docs/prompts/`**。当前 `docs/prompts/...` 执行 Prompt 包**在磁盘上存在，但既未被 git 跟踪、也会被 ignore**（`git check-ignore` 已确认）。要提交该包需先收窄规则（如改为 `/prompts/` 或 `/mcp/prompts/`）并 `git add -f` 或调整后 add。**改动 `.gitignore` 前先与用户确认。** |
+| G1 | **不要重新引入 broad `prompts/` 忽略规则**（已修复，勿回退） | 曾有一条 `prompts/` 规则过宽，会同时吞掉运行时插件的 `prompts/` 和 `docs/prompts/`，导致整个执行 Prompt 包**在磁盘上存在却既未跟踪、又被忽略**（已删除该规则修复）。prompts 在本项目是**源文件**（Task 4.0 的 `prompts/*.md` 模板、`docs/prompts/`），不是运行时产物——运行时 SPEC.md/PLAN.md 落在 repo 外的 `control_root`，本就不进仓库。不要为"清理"重新加回 `prompts/` 或 `/prompts/`，否则 Task 4.0 模板提交不了。 |
 | G2 | **包名陷阱** | 严禁用本地 `mcp/` 作为包名——它会 shadow 官方 MCP SDK。包必须是 `src/zcode_agentflow`。 |
 | G3 | **Windows 非法字符** | operation_id 含 `:` 等在 Windows 不能做目录名。ID 正则 `^[A-Za-z0-9._-]+$`，分隔用 `__`（如 `<run_id>__draft-spec__r4__a2`）。 |
 | G4 | **MCP stdout 是协议通道** | FastMCP stdio 下任何 `print()` / `logging` 到 stdout / 子进程 stdout 直通 / traceback 都会破坏 framing。日志走 stderr，子进程 stdout 必须 capture。 |
