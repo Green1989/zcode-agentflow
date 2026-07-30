@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "_phase": 0,
+  "_status": "PARTIAL — incremental; Tasks 0.1 confirmed, 0.2-0.5 pending",
+  "_discipline": "All facts here are backed by real Phase 0 spike runs, not model memory. Spike scripts/raw outputs live outside the repo (control_root). Every value cites its evidence.",
+  "_evidence_control_root": "<repo-external temp dir; not committed>",
+  "_sanitized": "No tokens, auth files, or sensitive absolute paths are committed; only sanitized command shapes, versions, and output structures.",
+
+  "versions": {
+    "python": "3.13.2",
+    "mcp_sdk": "1.8.1",
+    "mcp_sdk_import_path": "mcp.server.fastmcp.FastMCP",
+    "mcp_protocol_version": "2024-11-05",
+    "portalocker": "2.10.1",
+    "jsonschema": "4.26.0",
+    "pyyaml": "6.0.2",
+    "pytest": "9.0.2",
+    "codex_cli": "0.146.0",
+    "grok_cli": "0.2.114",
+    "git": "2.44.0.windows.1",
+    "zcode": "3.5.3.3911",
+    "_note": "portalocker/pytest-mock were installed during the spike (not pre-installed); mcp SDK is the OFFICIAL 'mcp' package under site-packages, not a local dir."
+  },
+
+  "zcode": {
+    "_summary": "How ZCode loads an MCP server and calls a tool — discovered via Task 0.1.",
+    "plugin_loaded": {
+      "value": true,
+      "evidence": "echo MCP server registered in ~/.zcode/cli/config.json -> mcp.servers.echo-spike (stdio). ZCode auto-connects user-scope MCP servers at session start. Verified: the server was connected and its tool was callable from the interactive session.",
+      "config_scope": "user (~/.zcode/cli/config.json -> mcp.servers)",
+      "auto_connect": true,
+      "_note": "Config-file MCP servers do NOT expand ${...} templates — absolute paths required (plugin-provided servers do expand templates)."
+    },
+    "mcp_stdio": {
+      "value": true,
+      "evidence": "Official mcp SDK client (stdio_client + ClientSession) drove initialize -> tools/list -> tools/call against echo/server.py directly; all three succeeded.",
+      "transport": "stdio",
+      "framing_owner": "FastMCP / mcp SDK (never hand-rolled)"
+    },
+    "manifest_fields": {
+      "config_file_mcp": {
+        "shape": "mcp.servers.<name> = { type:'stdio', command:<abs path>, args:[<abs paths>], env:{...}, enabled?, timeoutMs? }",
+        "strict_schema": "unknown key => server dropped",
+        "template_expansion": "NONE for config-file servers; absolute paths required"
+      },
+      "plugin_manifest": {
+        "path": ".zcode-plugin/plugin.json",
+        "component_fields": ["commands", "skills", "hooks", "mcpServers", "agents"],
+        "mcpServers_shape": "<name>: { command, args[], cwd, env } — plugins DO expand ${ZCODE_PROJECT_DIR}/${ZCODE_PLUGIN_ROOT}/${user_config.KEY}",
+        "observed_real_example": "android-emulator/ios-simulator plugins in the official cache"
+      }
+    },
+    "sdk_import_path": {
+      "value": "mcp.server.fastmcp.FastMCP",
+      "evidence": "importlib.util.find_spec('mcp.server.fastmcp') -> FOUND; origin under site-packages, NOT under repo. No local mcp/ shadow (G2 trap avoided)."
+    },
+    "echo_tool_call": {
+      "value": true,
+      "evidence": "In a real interactive ZCode session, PreToolUse/PostToolUse hooks captured tool_name='mcp__echo-spike__echo' with tool_input={text:'hello'} and toolResponse.content[0].text='{\"echo\": \"hello\"}', isError=false.",
+      "tool_naming_convention": "mcp__<server>__<tool>",
+      "input_schema_source": "Pydantic-generated from the @mcp_server.tool() function signature"
+    }
+  }
+}
