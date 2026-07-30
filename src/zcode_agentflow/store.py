@@ -21,8 +21,10 @@ The operation lifecycle (3.3), two-phase transactions (3.4), atomic promotion
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import secrets
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,6 +44,14 @@ __all__ = [
     "OperationManager",
     "OperationConflict",
     "classify_unknown_replay",
+    "ALLOWED_FROM",
+    "BeginResult",
+    "Store",
+    "CasMismatch",
+    "LeaseMismatch",
+    "ActiveOperationInProgress",
+    "ActiveOperationMismatch",
+    "TransitionNotAllowed",
 ]
 
 STATE_FILENAME = "state.json"
@@ -314,6 +324,365 @@ def classify_unknown_replay(op: Operation, *, allow_costful_replay: bool) -> str
         return "NEEDS_HUMAN"
     # unknown policy string -> be safe (never auto-replay something we can't classify)
     return "NEEDS_HUMAN"
+
+
+# ===========================================================================
+# Two-phase transactions: begin / finish / fail / unknown (Task 3.4; P0-3, P0-2)
+#
+# External CLI calls run BETWEEN two short locked transactions:
+#
+#     br = store.begin_operation(...)          # short lock
+#     try:
+#         adapter.invoke(...)                   # NO lock held
+#         store.finish_operation(lease=br.lease_token,
+#                                expected_revision=br.revision_after_begin, ...)
+#     except AdapterError:
+#         store.fail_operation(lease=br.lease_token, ...)
+#     # timeout/kill -> store.mark_unknown(...)
+#
+# ``_guard`` does NOT acquire the lock; ALLOWED_FROM + CAS + the hard one-active-op
+# gate all happen INSIDE begin_operation / finish_operation. The Run lock is held
+# ONLY across the short bookkeeping step, never across the adapter call (the v2
+# deadlock came from violating this).
+# ===========================================================================
+
+
+class CasMismatch(RuntimeError):
+    """``expected_revision`` did not equal the current state.revision (a stale
+    caller raced a newer transition)."""
+
+
+class LeaseMismatch(RuntimeError):
+    """The supplied lease_token does not match the active operation's stored
+    lease hash (a stale finish/fail/unknown from a previous begin of the same
+    op id, or a plain wrong token)."""
+
+
+class ActiveOperationInProgress(RuntimeError):
+    """A DIFFERENT operation is already mid-external (active_operation_id is set
+    and != the requested operation_id). Only the SAME id (idempotent re-entry)
+    or Store.recover may proceed."""
+
+
+class ActiveOperationMismatch(RuntimeError):
+    """finish_operation was called for an operation_id that is no longer the
+    active one (another op interleaved / recover cleared the active op)."""
+
+
+class TransitionNotAllowed(RuntimeError):
+    """The tool is not allowed to run from the current state (ALLOWED_FROM)."""
+
+
+# ALLOWED_FROM: each tool may begin only from one of these source states
+# (Spec §3.1 / §5.1). The Store enforces this at begin time. (Engine task 6.x
+# fills the bodies; this table is the authority the Store checks against.)
+ALLOWED_FROM: dict[str, frozenset[str]] = {
+    "workflow_init": frozenset({"NEW"}),
+    "planner_draft_spec": frozenset(
+        {"INITIALIZING_WORKTREE", "NEEDS_USER_INPUT"}
+    ),
+    "workflow_approve_spec": frozenset({"READY_FOR_SPEC_APPROVAL"}),
+    "planner_create_plan": frozenset({"PLANNING"}),
+    "workflow_start_task": frozenset({"READY_FOR_EXECUTION"}),
+    "workflow_verify_task": frozenset({"EXECUTING_TASK"}),
+    "reviewer_review_task": frozenset({"VERIFYING_TASK"}),
+    "workflow_complete_task": frozenset({"REVIEWING_TASK"}),
+}
+
+
+@dataclass
+class BeginResult:
+    """Result of :meth:`Store.begin_operation`.
+
+    ``revision_after_begin`` is the run-state revision AFTER begin (which did
+    +1); finish_operation MUST pass it back as ``expected_revision`` — that is
+    the CAS that binds the external phase to the begin that started it (passing
+    the PRE-begin revision is rejected — the v2.1 CAS gap).
+    """
+
+    operation_id: str
+    lease_token: str
+    revision_after_begin: int
+    staging_dir: Path
+    state_snapshot: dict
+
+
+class Store:
+    """The Run Store: the SOLE writer of state.json / events.jsonl / operations/.
+
+    Every mutating method takes the per-Run lock (``locks.run_lock``) for a
+    SHORT bookkeeping step and releases it before returning — the external
+    adapter call runs OUTSIDE the lock (P0-3). ``finish_operation`` is the SOLE
+    committer of ``state.json`` (errata #6).
+    """
+
+    def __init__(self, control_root):
+        self.control_root = Path(control_root)
+        self.control_root.mkdir(parents=True, exist_ok=True)
+
+    # ---- read helpers (no lock; state.json is atomic on disk) ------------
+
+    def load_state(self) -> State:
+        return State.load(self.control_root)
+
+    # ---- lease hashing ---------------------------------------------------
+
+    @staticmethod
+    def _hash_lease(lease_token: str) -> str:
+        """Store the lease as a SHA-256 hex (never plaintext), so the persisted
+        state.json cannot leak the token."""
+        return hashlib.sha256(lease_token.encode("utf-8")).hexdigest()
+
+    # ---- BEGIN (short lock) ----------------------------------------------
+
+    def begin_operation(self, *, operation_id, request, tool, expected_revision,
+                        intermediate_state, replay_policy) -> BeginResult:
+        """Take the per-Run lock, verify the hard gate + ALLOWED_FROM + CAS,
+        advance to the intermediate state with revision+1, write a recoverable
+        begin event + state_after snapshot, set active_operation_id + lease,
+        and return a :class:`BeginResult`. RELEASES the lock before returning.
+
+        HARD GATE (parallel P0-2): if ``state.active_operation_id`` is set AND
+        differs from ``operation_id`` -> raise :class:`ActiveOperationInProgress`.
+        Re-entering with the SAME id is the idempotent path (returns a fresh
+        BeginResult for the in-flight op).
+        """
+        from zcode_agentflow import locks as _locks
+
+        with _locks.run_lock(self.control_root):
+            state = State.load(self.control_root)
+
+            # HARD GATE: at most one active op per Run.
+            if state.active_operation_id is not None and state.active_operation_id != operation_id:
+                raise ActiveOperationInProgress(
+                    f"another operation {state.active_operation_id!r} is already "
+                    f"in progress on run {state.run_id!r}; cannot begin "
+                    f"{operation_id!r}"
+                )
+
+            # ALLOWED_FROM: tool may run from the current state.
+            allowed = ALLOWED_FROM.get(tool)
+            if allowed is None:
+                raise TransitionNotAllowed(f"unknown tool {tool!r}")
+            if state.state not in allowed:
+                raise TransitionNotAllowed(
+                    f"tool {tool!r} cannot run from state {state.state!r} "
+                    f"(allowed: {sorted(allowed)})"
+                )
+
+            # CAS: caller's expected_revision must match the PRE-begin revision.
+            if expected_revision != state.revision:
+                raise CasMismatch(
+                    f"expected_revision {expected_revision} != current "
+                    f"{state.revision} (run {state.run_id!r})"
+                )
+
+            # Prepare the operation record (idempotent if the same op re-begins).
+            op = OperationManager(self.control_root).prepare(
+                operation_id=operation_id, request=request, replay_policy=replay_policy
+            )
+            op.status = "RUNNING"
+
+            # Advance to the intermediate state with revision+1; set the active
+            # op + lease (stored HASHED).
+            pre_begin_state = state.state
+            pre_begin_rev = state.revision
+            lease_token = secrets.token_urlsafe(32)
+            state.previous_state = pre_begin_state
+            state.state = intermediate_state
+            state.revision = pre_begin_rev + 1
+            state.active_operation_id = operation_id
+            state.active_operation_lease = self._hash_lease(lease_token)
+
+            # Write a recoverable state_after snapshot for the begin transition
+            # (so a crash mid-external can reconstruct the intermediate state —
+            # parallel P0-2: begin writes events, not only finish).
+            snap_rel, snap_sha = op.write_state_snapshot(
+                "state_after", state.to_dict()
+            )
+            # persist state.json (the intermediate snapshot is now visible to
+            # readers; the op is RUNNING). This is NOT the commit — finish is.
+            state.save(self.control_root)
+            EventLog(self.control_root).append(
+                operation_id=operation_id,
+                from_state=pre_begin_state,
+                to_state=intermediate_state,
+                reason=tool,
+                state_after_path=snap_rel,
+                state_after_sha=snap_sha,
+                revision=state.revision,
+            )
+
+            return BeginResult(
+                operation_id=operation_id,
+                lease_token=lease_token,
+                revision_after_begin=state.revision,
+                staging_dir=op.dir,
+                state_snapshot=state.to_dict(),
+            )
+
+    # ---- verify op + lease (shared by finish/fail/unknown) ----------------
+
+    def _verify_active_op(self, state: State, operation_id: str, lease_token: str) -> None:
+        if state.active_operation_id != operation_id:
+            raise ActiveOperationMismatch(
+                f"operation {operation_id!r} is not the active operation "
+                f"(active is {state.active_operation_id!r})"
+            )
+        if state.active_operation_lease != self._hash_lease(lease_token):
+            raise LeaseMismatch(
+                f"lease token does not match the active operation {operation_id!r}"
+            )
+
+    # ---- FINISH (short lock; SOLE committer of state.json, errata #6) ----
+
+    def finish_operation(self, *, operation_id, lease_token, expected_revision,
+                         next_state, staged_artifacts, result) -> dict:
+        """Re-take the per-Run lock, verify op + lease + revision_after_begin,
+        write the result + the next state_after snapshot, append the finish
+        event, and perform the SINGLE ``os.replace(state.json)`` that commits
+        the transition. Then mark the op COMMITTED and clear the active op.
+
+        ``staged_artifacts`` (a {logical_name: bytes} map) is consumed by
+        Task 3.5's prepare_generation; here it is accepted and (for this task)
+        only persisted as the operation's result material if provided.
+        """
+        from zcode_agentflow import locks as _locks
+
+        with _locks.run_lock(self.control_root):
+            state = State.load(self.control_root)
+            self._verify_active_op(state, operation_id, lease_token)
+            # CAS: the caller must pass revision_after_begin (== current revision).
+            if expected_revision != state.revision:
+                raise CasMismatch(
+                    f"finish expected_revision {expected_revision} != current "
+                    f"{state.revision} for op {operation_id!r}"
+                )
+
+            op = OperationManager(self.control_root).open_existing(operation_id)
+
+            # advance to next_state with revision+1; clear the active op + lease.
+            pre_state = state.state
+            state.previous_state = pre_state
+            state.state = next_state
+            state.revision = state.revision + 1
+            state.active_operation_id = None
+            state.active_operation_lease = None
+
+            # persist the adapter result (if any) + the new state_after snapshot.
+            if result is not None:
+                op.write_result(result)
+
+            # prepare_generation (Task 3.5) is plugged in here in 3.5; for now,
+            # staged_artifacts is accepted but only the result is recorded. The
+            # single commit point is the state.json replace below.
+            snap_rel, snap_sha = op.write_state_snapshot(
+                "state_after", state.to_dict()
+            )
+            # THE ONLY COMMIT POINT: single os.replace(state.json).
+            state.save(self.control_root)
+            EventLog(self.control_root).append(
+                operation_id=operation_id,
+                from_state=pre_state,
+                to_state=next_state,
+                reason=f"finish:{operation_id.split('__')[1] if '__' in operation_id else operation_id}",
+                state_after_path=snap_rel,
+                state_after_sha=snap_sha,
+                revision=state.revision,
+            )
+            op.mark_committed()
+            return {
+                "operation_id": operation_id,
+                "state": next_state,
+                "revision": state.revision,
+                "committed": True,
+            }
+
+    # ---- FAIL (short lock) -----------------------------------------------
+
+    def fail_operation(self, *, operation_id, lease_token, reason) -> dict:
+        """An adapter exception path: mark the op FAILED, transition to
+        NEEDS_HUMAN, clear the active op. The Run is NOT stranded mid-external."""
+        from zcode_agentflow import locks as _locks
+
+        with _locks.run_lock(self.control_root):
+            state = State.load(self.control_root)
+            self._verify_active_op(state, operation_id, lease_token)
+
+            op = OperationManager(self.control_root).open_existing(operation_id)
+            pre_state = state.state
+            state.previous_state = pre_state
+            state.state = "NEEDS_HUMAN"
+            state.revision = state.revision + 1
+            state.active_operation_id = None
+            state.active_operation_lease = None
+            snap_rel, snap_sha = op.write_state_snapshot(
+                "state_after", state.to_dict()
+            )
+            state.save(self.control_root)
+            EventLog(self.control_root).append(
+                operation_id=operation_id,
+                from_state=pre_state,
+                to_state="NEEDS_HUMAN",
+                reason=f"fail:{reason}",
+                state_after_path=snap_rel,
+                state_after_sha=snap_sha,
+                revision=state.revision,
+            )
+            op.mark_failed()
+            return {
+                "operation_id": operation_id,
+                "state": "NEEDS_HUMAN",
+                "revision": state.revision,
+                "reason": reason,
+            }
+
+    # ---- UNKNOWN (short lock) --------------------------------------------
+
+    def mark_unknown(self, *, operation_id, lease_token, reason,
+                     allow_costful_replay: bool = False) -> dict:
+        """Adapter timeout/process-kill path: mark the op UNKNOWN, classify the
+        replay outcome by ``replay_policy`` (Task 3.3), and clear the active op.
+
+        The Run state is left in its intermediate state but with the active op
+        cleared; full recovery (replaying a SAFE_READ op, surfacing NEEDS_HUMAN)
+        is :meth:`Store.recover` in Task 3.8. Here we record the classification
+        so the caller/engine knows the outcome.
+        """
+        from zcode_agentflow import locks as _locks
+
+        with _locks.run_lock(self.control_root):
+            state = State.load(self.control_root)
+            self._verify_active_op(state, operation_id, lease_token)
+
+            op = OperationManager(self.control_root).open_existing(operation_id)
+            op.mark_unknown()
+            outcome = classify_unknown_replay(op, allow_costful_replay=allow_costful_replay)
+
+            pre_state = state.state
+            # clear the active op regardless (the lease is void once unknown);
+            # do NOT advance the run state here — recover owns the next move.
+            state.active_operation_id = None
+            state.active_operation_lease = None
+            snap_rel, snap_sha = op.write_state_snapshot(
+                "state_after", state.to_dict()
+            )
+            state.save(self.control_root)
+            EventLog(self.control_root).append(
+                operation_id=operation_id,
+                from_state=pre_state,
+                to_state=pre_state,  # state unchanged on unknown
+                reason=f"unknown:{reason} (outcome={outcome})",
+                state_after_path=snap_rel,
+                state_after_sha=snap_sha,
+                revision=state.revision,
+            )
+            return {
+                "operation_id": operation_id,
+                "status": "UNKNOWN",
+                "outcome": outcome,
+                "reason": reason,
+            }
 
 
 # ===========================================================================
