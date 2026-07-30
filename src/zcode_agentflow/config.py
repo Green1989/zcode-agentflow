@@ -17,7 +17,20 @@ from pathlib import Path
 import jsonschema
 import yaml
 
-__all__ = ["CONFIG_SCHEMA", "DEFAULTS", "ConfigError", "load", "validate_capabilities"]
+__all__ = [
+    "CONFIG_SCHEMA",
+    "DEFAULTS",
+    "ConfigError",
+    "CapabilityError",
+    "load",
+    "validate_capabilities",
+]
+
+
+class CapabilityError(RuntimeError):
+    """Raised at startup when a required capability is missing, an unknown gate
+    is present, or a fallback-capable gate is false but its fallback is not
+    allowed by config (Spec §5.4 / G6: fail loud, never silently degrade)."""
 
 
 class ConfigError(ValueError):
@@ -214,12 +227,92 @@ def load(path) -> dict:
     return _apply_defaults(cfg)
 
 
-def validate_capabilities(config: dict, capabilities_findings: dict | None = None) -> dict:
-    """Validate classified capability gates at startup (Task 1.4).
+def validate_capabilities(config: dict, capabilities_findings: dict) -> dict:
+    """Validate classified capability gates at startup (Task 1.4; P1-1, P1-2).
 
-    Body implemented in Task 1.4. Signature declared here per the Task 1.2
-    [CONTRACT]. Returns an effective_config (resolved approval mode / reasoning
-    effort). Raises CapabilityError when a required gate is false or an unknown
-    gate is present.
+    Gate class semantics (Task 0.5 / docs/capabilities.json gates._summary):
+      - ``required``        : value is false  => startup fail
+      - ``optional``        : never blocks (value irrelevant)
+      - ``fallback-capable``: value is false  => allowed ONLY if its fallback is
+                                acceptable per config; otherwise fail
+      - ``unknown``         (or any unrecognized class): block
+
+    Runs in server startup (Task 1.5) and before workflow_init. Returns an
+    ``effective_config`` with the resolved approval mode and reasoning effort.
+
+    Special gates (resolved into the effective_config):
+      - ``tool_confirmation``:
+          * value true  => effective_approval_mode = "prefer_zcode_tool_confirmation"
+          * value false + allow_non_adversarial_fallback=true
+                        => effective_approval_mode = "non_adversarial_convention"
+          * value false + allow_non_adversarial_fallback=false => CapabilityError
+      - ``reasoning_effort_high``:
+          * value true  => "high"; value false => fallback "medium"
     """
-    raise NotImplementedError("validate_capabilities is implemented in Task 1.4")
+    findings = capabilities_findings or {}
+    allow_fallback = bool(
+        config.get("human_gates", {}).get("spec_approval", {}).get(
+            "allow_non_adversarial_fallback", False
+        )
+    )
+
+    # default effective values (absent special gates)
+    effective = {
+        "effective_approval_mode": "prefer_zcode_tool_confirmation",
+        "effective_reasoning_effort": "high",
+    }
+
+    KNOWN_CLASSES = {"required", "optional", "fallback-capable"}
+
+    for name, gate in findings.items():
+        if name.startswith("_"):
+            continue  # doc-comment metadata (e.g. gates._summary), not a gate
+        if not isinstance(gate, dict):
+            raise CapabilityError(f"gate {name!r} is not an object: {gate!r}")
+        cls = gate.get("class")
+        value = gate.get("value")
+
+        # unknown class OR explicit unknown value => block (resolve before startup)
+        if cls not in KNOWN_CLASSES or value == "unknown" or cls == "unknown":
+            raise CapabilityError(
+                f"capability gate {name!r} is unresolved (class={cls!r}, value={value!r})"
+            )
+
+        if cls == "optional":
+            continue  # never blocks
+
+        if cls == "required":
+            if not value:
+                raise CapabilityError(
+                    f"required capability {name!r} is not available (value=false)"
+                )
+            continue
+
+        # fallback-capable
+        if value:
+            continue  # capability present; no fallback needed
+
+        # value is false for a fallback-capable gate — gate-specific resolution
+        if name == "tool_confirmation":
+            if allow_fallback:
+                effective["effective_approval_mode"] = "non_adversarial_convention"
+            else:
+                raise CapabilityError(
+                    "fallback-capable capability 'tool_confirmation' is false and "
+                    "config human_gates.spec_approval.allow_non_adversarial_fallback "
+                    "is false — refusing to silently degrade (Spec §5.4 / G6)"
+                )
+        elif name == "reasoning_effort_high":
+            fallback = gate.get("fallback", "medium")
+            effective["effective_reasoning_effort"] = fallback
+        else:
+            # a generic fallback-capable gate that is false: allowed only if the
+            # operator opted into degradation. We map that opt-in to the single
+            # global fallback switch; tool_confirmation is the canonical case.
+            if not allow_fallback:
+                raise CapabilityError(
+                    f"fallback-capable capability {name!r} is false and no fallback "
+                    "is allowed by config"
+                )
+
+    return effective
