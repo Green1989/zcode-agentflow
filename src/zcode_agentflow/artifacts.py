@@ -140,7 +140,8 @@ def load_generation(control_root, generation_id) -> Generation:
 
 
 def prepare_generation(*, control_root, operation_id, changes: dict[str, bytes],
-                       prev_state, next_state) -> Generation:
+                       prev_state, next_state,
+                       crash_after=None, crash_after_manifest=None) -> Generation:
     """Build the next generation WITHOUT committing it.
 
     Steps (errata #6 — does NOT touch state.json):
@@ -176,12 +177,25 @@ def prepare_generation(*, control_root, operation_id, changes: dict[str, bytes],
         # blob path is RELATIVE to control_root (self-resolving from control_root)
         index[name] = {"blob": f"{ARTIFACTS_DIRNAME}/{BLOBS_DIRNAME}/{sha}", "sha256": sha}
 
+    # fault-injection checkpoint: crash AFTER blobs are written but BEFORE the
+    # manifest (Task 3.6). The partial generation is invisible to readers
+    # (state.json still points at the old generation).
+    if crash_after:
+        from zcode_agentflow.store import _crash_checkpoint
+        _crash_checkpoint(crash_after)
+
     gen = Generation(generation_id=operation_id, index=index)
 
     # 3. write the generation manifest (not yet committed)
     gdir = _generation_dir(control_root, operation_id)
     gdir.mkdir(parents=True, exist_ok=True)
     canonical.write_canonical_json(gdir / MANIFEST_FILENAME, gen.to_dict())
+
+    # fault-injection checkpoint: crash AFTER the manifest is written (still
+    # invisible — state.json is not yet replaced to point at this generation).
+    if crash_after_manifest:
+        from zcode_agentflow.store import _crash_checkpoint
+        _crash_checkpoint(crash_after_manifest)
 
     # 4. fill next_state fields ONLY (do NOT replace state.json)
     next_state.artifact_generation = operation_id

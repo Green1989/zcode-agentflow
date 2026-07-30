@@ -52,6 +52,8 @@ __all__ = [
     "ActiveOperationInProgress",
     "ActiveOperationMismatch",
     "TransitionNotAllowed",
+    "CrashInjected",
+    "StateCorruptError",
 ]
 
 STATE_FILENAME = "state.json"
@@ -76,6 +78,13 @@ def _utc_now_iso() -> str:
 
 class StateError(RuntimeError):
     """Raised when state.json is missing/corrupt and cannot be loaded."""
+
+
+class StateCorruptError(RuntimeError):
+    """Raised by :meth:`Store.recover` when state.json is corrupt/missing AND
+    it cannot be rebuilt from the latest event's snapshot (snapshot missing or
+    its sha mismatches). Recovery surfaces this so a human decides — it never
+    silently picks another run (Task 3.8 enforces pointer-scoped recovery)."""
 
 
 class OperationConflict(RuntimeError):
@@ -373,6 +382,28 @@ class TransitionNotAllowed(RuntimeError):
     """The tool is not allowed to run from the current state (ALLOWED_FROM)."""
 
 
+class CrashInjected(RuntimeError):
+    """A simulated process kill at a named checkpoint (Task 3.6 fault injection).
+
+    Driven by the ``AGENTFLOW_CRASH_AFTER`` env var: when it names a checkpoint
+    that the Store reaches, the Store raises this INSTEAD of continuing. The
+    fault-injection matrix then recovers from disk with a fresh Store, proving
+    recovery is correct at every step. Production code never sets that env var,
+    so checkpoints are inert in normal operation.
+    """
+
+
+def _crash_checkpoint(name: str) -> None:
+    """Raise :class:`CrashInjected` if ``AGENTFLOW_CRASH_AFTER`` == ``name``.
+
+    Called at named points inside begin/finish/prepare_generation so the
+    fault-injection test can kill the process at exactly that step. Inert when
+    the env var is unset (production path).
+    """
+    if os.environ.get("AGENTFLOW_CRASH_AFTER") == name:
+        raise CrashInjected(f"crash injected at checkpoint {name!r}")
+
+
 # ALLOWED_FROM: each tool may begin only from one of these source states
 # (Spec §3.1 / §5.1). The Store enforces this at begin time. (Engine task 6.x
 # fills the bodies; this table is the authority the Store checks against.)
@@ -419,6 +450,7 @@ class Store:
     def __init__(self, control_root):
         self.control_root = Path(control_root)
         self.control_root.mkdir(parents=True, exist_ok=True)
+        self._last_recover_outcome: str | None = None
 
     # ---- read helpers (no lock; state.json is atomic on disk) ------------
 
@@ -482,6 +514,7 @@ class Store:
                 operation_id=operation_id, request=request, replay_policy=replay_policy
             )
             op.status = "RUNNING"
+            _crash_checkpoint("begin_after_request_written")
 
             # Advance to the intermediate state with revision+1; set the active
             # op + lease (stored HASHED).
@@ -496,13 +529,17 @@ class Store:
 
             # Write a recoverable state_after snapshot for the begin transition
             # (so a crash mid-external can reconstruct the intermediate state —
-            # parallel P0-2: begin writes events, not only finish).
+            # parallel P0-2: begin writes events, not only finish). Each event
+            # gets its OWN snapshot file (state_after_begin/finish/...) so a later
+            # transition on the same op cannot overwrite an earlier event's
+            # snapshot (which would invalidate that event's recorded sha).
             snap_rel, snap_sha = op.write_state_snapshot(
-                "state_after", state.to_dict()
+                "state_after_begin", state.to_dict()
             )
             # persist state.json (the intermediate snapshot is now visible to
             # readers; the op is RUNNING). This is NOT the commit — finish is.
             state.save(self.control_root)
+            _crash_checkpoint("begin_after_state_save")
             EventLog(self.control_root).append(
                 operation_id=operation_id,
                 from_state=pre_begin_state,
@@ -512,6 +549,7 @@ class Store:
                 state_after_sha=snap_sha,
                 revision=state.revision,
             )
+            _crash_checkpoint("begin_after_event")
 
             return BeginResult(
                 operation_id=operation_id,
@@ -574,6 +612,7 @@ class Store:
             # persist the adapter result (if any) + the new state_after snapshot.
             if result is not None:
                 op.write_result(result)
+            _crash_checkpoint("finish_after_result")
 
             # prepare_generation (Task 3.5): write blobs + the new generation
             # manifest and FILL state.artifact_generation / per-artifact shas.
@@ -588,12 +627,16 @@ class Store:
                     changes=staged_artifacts,
                     prev_state=State.load(self.control_root),
                     next_state=state,
+                    crash_after="finish_after_blobs",
+                    crash_after_manifest="finish_after_manifest",
                 )
             snap_rel, snap_sha = op.write_state_snapshot(
-                "state_after", state.to_dict()
+                "state_after_finish", state.to_dict()
             )
+            _crash_checkpoint("finish_after_snapshot")
             # THE ONLY COMMIT POINT: single os.replace(state.json).
             state.save(self.control_root)
+            _crash_checkpoint("finish_after_state_replace")
             EventLog(self.control_root).append(
                 operation_id=operation_id,
                 from_state=pre_state,
@@ -603,6 +646,7 @@ class Store:
                 state_after_sha=snap_sha,
                 revision=state.revision,
             )
+            _crash_checkpoint("finish_after_event")
             op.mark_committed()
             return {
                 "operation_id": operation_id,
@@ -630,7 +674,7 @@ class Store:
             state.active_operation_id = None
             state.active_operation_lease = None
             snap_rel, snap_sha = op.write_state_snapshot(
-                "state_after", state.to_dict()
+                "state_after_fail", state.to_dict()
             )
             state.save(self.control_root)
             EventLog(self.control_root).append(
@@ -678,7 +722,7 @@ class Store:
             state.active_operation_id = None
             state.active_operation_lease = None
             snap_rel, snap_sha = op.write_state_snapshot(
-                "state_after", state.to_dict()
+                "state_after_unknown", state.to_dict()
             )
             state.save(self.control_root)
             EventLog(self.control_root).append(
@@ -696,6 +740,164 @@ class Store:
                 "outcome": outcome,
                 "reason": reason,
             }
+
+    # ---- RECOVERY (Task 3.6 core; Task 3.8 adds pointer integration) ------
+
+    def last_recover_outcome(self) -> str | None:
+        """Return the replay outcome label from the most recent ``recover()``
+        (``"REPLAY"`` / ``"NEEDS_HUMAN"``), or None if recover has not run or
+        found no orphan to classify. Used by the fault-injection matrix to
+        assert the classification without re-deriving it."""
+        return self._last_recover_outcome
+
+    def recover(self, *, allow_costful_replay: bool = False) -> State:
+        """Single entry for crash recovery. Under the per-Run lock:
+
+          1. try to load state.json; if it is missing/corrupt, REBUILD from the
+             latest event's ``state_after`` snapshot (verifying its sha); if that
+             also fails, raise :class:`StateCorruptError`;
+          2. if an ``active_operation_id`` is set (a process was killed
+             mid-external), open the op, mark it UNKNOWN, classify the replay
+             outcome by its ``replay_policy``, and CLEAR ``active_operation_id``
+             (and the stored lease);
+          3. rewrite state.json (so the cleared active op is durable) and return
+             the recovered State.
+
+        ``recover`` never scans for "newest" runs and never auto-switches
+        projects — it recovers THIS run only. Pointer-driven run selection
+        (``bootstrap.resume_active_run``) lands in Task 3.8.
+        """
+        from zcode_agentflow import locks as _locks
+
+        with _locks.run_lock(self.control_root):
+            self._last_recover_outcome = None
+
+            # 1. load or rebuild state.json
+            state = self._load_or_rebuild_state()
+
+            # 1b. reconcile the op named by the latest event. If a finish
+            # committed the state.json but crashed BEFORE op.mark_committed()
+            # (crash points finish_after_state_replace / finish_after_event),
+            # the op is still RUNNING while the run state already advanced.
+            # Per the plan's crash semantics ("crash after step 6 before step 7
+            # -> state committed, recover marks op COMMITTED"), reconcile it.
+            latest = EventLog(self.control_root).latest()
+            if latest is not None:
+                self._reconcile_latest_op(latest, state)
+
+            # 2. classify + clear an orphan active op
+            if state.active_operation_id:
+                op_id = state.active_operation_id
+                try:
+                    op = OperationManager(self.control_root).open_existing(op_id)
+                except FileNotFoundError:
+                    op = None  # orphan points at a missing op dir; just clear it
+                outcome = "NEEDS_HUMAN"
+                if op is not None:
+                    if op.status not in ("COMMITTED", "FAILED", "UNKNOWN"):
+                        op.mark_unknown()
+                    outcome = classify_unknown_replay(
+                        op, allow_costful_replay=allow_costful_replay
+                    )
+                state.active_operation_id = None
+                state.active_operation_lease = None
+                self._last_recover_outcome = outcome
+
+            # 3. persist the recovered state
+            state.save(self.control_root)
+            return state
+
+    def _reconcile_latest_op(self, latest_event: dict, state: State) -> None:
+        """Reconcile an op left mid-lifecycle by a crash.
+
+        Two crash windows (plan Task 3.4 crash semantics):
+
+        A) crash AFTER the single state.json replace (step 6) but BEFORE
+           op.mark_committed (step 7): the run state is advanced and
+           ``active_operation_id`` is cleared, but the op is still RUNNING. The
+           latest event is the op's BEGIN (the finish event was never appended).
+           Detection: state has NO active op, the latest event's op is the one
+           that began the in-flight transition, that op is RUNNING with a result,
+           and the begin event's snapshot has ``active_operation_id`` SET while
+           the current state has it CLEARED (i.e. a finish cleared it). => mark
+           the op COMMITTED.
+
+        B) a finish event WAS appended (crash after finish_after_event) but
+           before op.mark_committed: the latest event is a FINISH whose snapshot
+           equals the current state.json (sha match) and has
+           ``active_operation_id`` cleared. => mark the op COMMITTED.
+        """
+        op_id = latest_event.get("operation_id")
+        if not op_id:
+            return
+        try:
+            op = OperationManager(self.control_root).open_existing(op_id)
+        except FileNotFoundError:
+            return
+        if op.status in ("COMMITTED", "FAILED", "UNKNOWN"):
+            return  # already terminal
+
+        snap_rel = latest_event.get("state_after_path")
+        expected_sha = latest_event.get("state_after_sha256")
+        if not snap_rel or not expected_sha or not (self.control_root / snap_rel).exists():
+            return
+        snap_path = self.control_root / snap_rel
+        snap = json.loads(snap_path.read_bytes())
+        snap_active = snap.get("active_operation_id")
+        current_sha = canonical.hash_file(self.control_root / STATE_FILENAME)
+
+        if current_sha == expected_sha:
+            # Case B: the latest event produced the current state. If this was a
+            # finish (active_op cleared in its snapshot), the op is committed.
+            if snap_active is None:
+                op.mark_committed()
+            return
+
+        # Case A: the latest event is a BEGIN (snap_active set) that did NOT
+        # produce the current state (sha differs) — meaning a finish replaced
+        # state.json and cleared active_operation_id, then crashed before either
+        # appending its own event or marking the op COMMITTED. If the current
+        # state has no active op AND this begin's op is RUNNING with a result,
+        # the finish committed — reconcile.
+        if snap_active == op_id and state.active_operation_id is None and op.has_result():
+            op.mark_committed()
+
+    def _load_or_rebuild_state(self) -> State:
+        """Load state.json; on corruption/absence, rebuild from the latest
+        event's ``state_after`` snapshot (sha-verified). Raise
+        :class:`StateCorruptError` if both fail."""
+        try:
+            return State.load(self.control_root)
+        except StateError:
+            pass  # fall through to rebuild
+
+        latest = EventLog(self.control_root).latest()
+        if latest is None:
+            raise StateCorruptError(
+                f"state.json is corrupt/missing and there are no events to "
+                f"rebuild from in {self.control_root}"
+            )
+        snap_rel = latest.get("state_after_path")
+        expected_sha = latest.get("state_after_sha256")
+        if not snap_rel or not expected_sha:
+            raise StateCorruptError(
+                "latest event carries no recoverable state_after snapshot"
+            )
+        snap_path = self.control_root / snap_rel
+        if not snap_path.exists():
+            raise StateCorruptError(
+                f"state_after snapshot missing: {snap_rel}"
+            )
+        actual_sha = canonical.hash_file(snap_path)
+        if actual_sha != expected_sha:
+            raise StateCorruptError(
+                f"state_after snapshot sha mismatch (expected {expected_sha}, "
+                f"got {actual_sha}) for {snap_rel}"
+            )
+        # rebuild state.json from the verified snapshot
+        rebuilt = State.from_dict(json.loads(snap_path.read_bytes()))
+        rebuilt.save(self.control_root)
+        return rebuilt
 
 
 # ===========================================================================
