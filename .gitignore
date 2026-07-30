@@ -56,3 +56,6 @@ $RECYCLE.BIN/
 *.pem
 *.key
 secrets.json
+
+# ---- prompts ----
+prompts/
