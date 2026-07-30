@@ -1,0 +1,106 @@
+# ZCode-AgentFlow production config (Task 1.2; Spec §6)
+#
+# Loaded + VALIDATED by src/zcode_agentflow/config.py (not a silent deep-merge):
+# unknown keys and wrong types are rejected. The `capabilities:` block mirrors
+# docs/capabilities.json (the Phase 0 source of truth) and is the input to
+# validate_capabilities() at startup (Task 1.4).
+#
+# IMPORTANT honesty fix (Review §六.3): the Spec's `verification.command_policy.
+# network: deny` is NOT a real isolation guarantee — the threat model states
+# the MCP layer provides process-integrity only, not OS-level network isolation
+# (see docs/capabilities.json gates.network_isolation: class=optional, v1
+# advisory-only). It is therefore expressed as the honest
+# `network_policy: advisory_only`.
+
+version: 1
+
+auth:                          # account login (NOT API tokens)
+  codex: chatgpt_account
+  grok: xai_account
+
+workflow:
+  worktree: true               # worktree placed OUTSIDE the repo
+  branch_prefix: agentflow
+  max_task_repair_rounds: 2    # v1.1+
+  max_replan_rounds: 2         # v1.2+
+
+human_gates:
+  spec_approval:
+    required: true
+    method: prefer_zcode_tool_confirmation        # §5.4 two-layer scheme
+    allow_non_adversarial_fallback: false         # false=fail at startup if unsupported; true=degrade with a warning
+  final_merge:
+    required: true
+    v1_terminal_state: READY_TO_MERGE             # v1 does NOT perform the merge action
+
+planner:
+  type: codex_cli
+  command: codex
+  mode: exec
+  model: gpt-5.6
+  model_reasoning_effort: high   # user-chosen high (not xhigh); falls back to medium if unsupported
+  sandbox: read-only
+  output_schema: schemas/spec-envelope.schema.json
+  timeout_sec: 600
+
+reviewer:
+  type: grok_build_cli
+  command: grok
+  model: grok-4.5
+  output_format: json
+  sandbox: read-only            # must resolve to the real flags for the installed CLI
+  timeout_sec: 300
+
+verification:                   # layer 1: verification command policy
+  command_policy:
+    shell: false
+    program_allowlist_from_agents_md: true
+    cwd_must_be_within: run_worktree_root
+    network_policy: advisory_only   # honest: v1 advisory only, NOT an enforced deny
+    secret_redaction: true
+
+change_policy:                  # layer 2: git change audit policy
+  on_unauthorized_delete: NEEDS_HUMAN
+  on_unauthorized_dependency: NEEDS_HUMAN
+  on_unauthorized_migration: NEEDS_HUMAN
+  on_undeclared_file: NEEDS_HUMAN
+  irreversible_migration: always_need_human
+
+review:
+  require:
+    - spec_compliance
+    - plan_compliance
+    - tests_passed
+    - no_high_severity_issues
+  cross_field_invariants: true
+
+# Capabilities block — MIRRORED from docs/capabilities.json (Phase 0 gates).
+# Single source of truth: docs/capabilities.json. This block is regenerated from
+# findings; do not hand-edit the class/value of a gate here.
+capabilities:
+  planner_ok:
+    value: true
+    class: required
+  reviewer_ok:
+    value: true
+    class: required
+  tool_confirmation:
+    value: false
+    class: fallback-capable
+    fallback: non_adversarial_convention
+  reasoning_effort_high:
+    value: true
+    class: fallback-capable
+    fallback: medium
+  mcp_stdio_server:
+    value: true
+    class: required
+  hook_contract_known:
+    value: true
+    class: required
+  network_isolation:
+    value: false
+    class: optional
+  proxy_required_for_external_llm:
+    value: true
+    class: required
