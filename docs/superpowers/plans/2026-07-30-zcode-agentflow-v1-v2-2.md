@@ -439,35 +439,41 @@ if __name__ == "__main__": main()
 6. **`gitops.py` exists as a dedicated, fully-tested module** (P0-2).
 7. Model-output **context invariants** enforced (run_id/goal/base_commit/plan_version/task=T001/empty deps/relative paths/allowlist) (P1-3).
 
-### Task 2.1: Strict schemas incl. planner-result wrapper (Review P0-8, §六.9; Prompt §6; P0-5)
+### Task 2.1: Strict schemas incl. planner-result wrapper + raw-vs-final split (Review P0-8, §六.9; Prompt §6; P0-5; parallel P0-4)
 
-**Goal:** author strict schemas; the `planner-result` wrapper lets a multi-task goal fail cleanly instead of after landing (P0-5).
+**Goal:** author strict schemas; the `planner-result` wrapper lets a multi-task goal fail cleanly (P0-5); and **separate raw model-output schemas from final authoritative schemas** so validation isn't a no-op (parallel P0-4: the model must NOT be asked to emit authoritative fields like run_id/hashes/base_commit, and the engine must NOT "overwrite then verify" — that can never catch a wrong model value).
 
 **Depends on:** Phase 1.
-**Files:** `schemas/{spec-envelope,planner-result,plan-envelope,execution-result,review-result}.schema.json`, `src/zcode_agentflow/schemas.py`, `tests/unit/test_schemas.py`.
+**Files:** `schemas/{spec-draft-output,plan-proposal,review-decision}.schema.json` (RAW, model-emitted) + `schemas/{spec-envelope,planner-result,plan-envelope,execution-result,review-result}.schema.json` (FINAL, engine-assembled), `src/zcode_agentflow/schemas.py`, `tests/unit/test_schemas.py`.
 
 **Tests first (`tests/unit/test_schemas.py`):** valid-pass + invalid-reject:
-- *spec-envelope:* missing `spec_markdown` rejected; unknown field rejected.
-- *planner-result (NEW):* `status=READY_FOR_EXECUTION` requires `plan` present & valid (1 task) & `questions` empty; `status=NEEDS_USER_INPUT` requires `plan=null` & ≥1 question; `status=BLOCKED` requires `plan=null` & non-empty `block_reason`; a 2-task `plan` inside the wrapper ⇒ wrapper invalid at validation (this is the P0-5 resolution: Codex can't smuggle multi-task through).
-- *plan-envelope:* 0 tasks rejected, 2 tasks rejected; task missing `verification_commands` rejected; verification item missing `program`/`kind` rejected.
+- *spec-draft-output (RAW):* what Codex actually emits — `{goal, spec_markdown, questions[], assumptions[]}`; **no** `run_id`/`status` authoritative fields. Missing `spec_markdown` rejected; unknown field rejected.
+- *plan-proposal (RAW):* what Codex emits — `{status: READY_FOR_EXECUTION|NEEDS_USER_INPUT|BLOCKED, plan?, questions?, block_reason?}`; `plan` is a strict single-task plan-envelope **without** authoritative run_id/base_commit (those are injected). 2-task `plan` ⇒ invalid.
+- *review-decision (RAW):* what Grok emits — `{decision, spec_compliance, plan_compliance, tests_sufficient, issues[], replan_required}`; **no** run_id/task_id/commits/hashes (engine injects those). PASS-with-issues rejected; FAIL-no-issues rejected; REPLAN-without-flag rejected.
+- *spec-envelope (FINAL):* engine-assembled — RAW spec + injected `run_id`, `status`.
+- *plan-envelope (FINAL):* landed — strict single-task, with injected `run_id`/`base_commit`/`plan_version`.
+- *review-result (FINAL):* engine-assembled — RAW decision + injected `run_id, task_id, base_commit, head_commit, spec_sha256, plan_sha256, task_manifest_sha256, plan_version`; non-64-hex hash rejected; bad `issues[*].severity` rejected.
 - *execution-result:* bad `status` enum rejected; `change_audit.dependency_files_changed` as string rejected (Review §六.9).
-- *review-result:* PASS-with-issues rejected (invariant); FAIL-no-issues rejected; REPLAN without flag rejected; non-64-hex `spec_sha256` rejected; bad `issues[*].severity` rejected.
 
 **Implementation requirements:**
 `[DATA]` shared defs: `hash`=`^[a-f0-9]{64}$`; `commit`=`^[0-9a-f]{7,40}$`; `task_id`=`^T[0-9]{3}(-R[0-9]+)?$`.
-`[DATA]` *planner-result* (NEW): top-level `status` enum `{READY_FOR_EXECUTION, NEEDS_USER_INPUT, BLOCKED}`, optional `plan` (a strict single-task plan-envelope), optional `questions[]`, optional `block_reason`. Conditional constraints as above (use `oneOf`/`if-then`). The **landed** `PLAN.md`/`plan-envelope.json` still only accepts READY+1-task (unchanged Spec protocol).
-`[DATA]` *plan-envelope* task item requires: `id`,`title`,`dependencies`,`declared_files`,`verification_commands`(each `{kind:enum[executable,cmd_script,bash_script], program, args[], cwd, timeout_sec}` — P1-5),`acceptance_criteria`,`planned_changes`.
-`[DATA]` *review-result* `issues[*]` requires `id,severity(enum),category(enum),file,line,description,required_action`. *execution-result* `change_audit` requires fixed-typed `deleted_files[], dependency_files_changed(bool), migrations_added[], undeclared_files_changed[]`.
+`[DATA]` **RAW schemas forbid authoritative fields** (`additionalProperties:false`, no run_id/hashes/commits); the model physically cannot emit them. **FINAL schemas require them** (engine-injected).
+`[DATA]` *plan-proposal* task item requires: `id`,`title`,`dependencies`,`declared_files`,`verification_commands`(each `{kind:enum[executable,cmd_script,bash_script], program, args[], cwd, timeout_sec}` — P1-5),`acceptance_criteria`,`planned_changes`. **No** `base_commit` (injected).
+`[DATA]` *review-decision* `issues[*]` requires `id,severity(enum),category(enum),file,line,description,required_action`.
 `[CONTRACT]`
 ```
-# schemas.py
-def validate_against(obj, schema_name); validate_spec(e); validate_planner_result(w); validate_plan(e)
-def validate_execution(obj); validate_review(obj)        # + cross-field invariants
+# schemas.py — TWO-STAGE validation (parallel P0-4): Adapter validates RAW; Engine injects authoritative fields then validates FINAL
+def validate_against(obj, schema_name)
+def validate_raw_spec(obj)          # spec-draft-output  (Adapter/Codex path)
+def validate_raw_plan(obj)          # plan-proposal      (Adapter/Codex path)
+def validate_raw_review(obj)        # review-decision    (Adapter/Grok path) + cross-field invariants on decision/issues
+def validate_spec(e); validate_plan(e); validate_review(obj)   # FINAL, post-injection + context invariants (Task 2.7)
 ```
+`[PSEUDO]` the rule (parallel P0-4): Adapter parses model JSON → validates the **raw** schema (no authoritative fields expected) → returns raw to Engine → Engine **injects** run_id/goal/base_commit/plan_version/hashes/commits from state → validates the **final** schema + context invariants. Never "overwrite model field then verify it matches" — the model never had the field, so there's nothing to overwrite or compare against; `base_commit`/hashes are engine-only.
 
 **Verification:** `python -m pytest tests/unit/test_schemas.py -v`
 **Expected:** all pass.
-**Commit message:** `feat: strict schemas + planner-result wrapper (P0-5, P0-8, §六.9, Prompt §6)`
+**Commit message:** `feat: strict schemas, planner-result wrapper, raw-vs-final split (P0-5, P0-8, §六.9, Prompt §6, parallel P0-4)`
 
 ### Task 2.2: Canonical bytes (Review §六.1; Prompt §7)
 
@@ -764,6 +770,9 @@ class OperationManager:
 - `test_fail_operation_on_adapter_exception` (P0-2) — simulate adapter raising; `fail_operation` marks the op FAILED, transitions to `NEEDS_HUMAN`, clears `active_operation_id`; the Run is **not** stuck in the intermediate state.
 - `test_mark_unknown_on_timeout_or_kill` (P0-2) — adapter timeout/process-kill ⇒ `mark_unknown` sets op UNKNOWN; per `replay_policy` (Task 3.3) it auto-replays (SAFE_READ), config-replays (COSTFUL_READ), or goes NEEDS_HUMAN (UNSAFE_WRITE); `active_operation_id` cleared.
 - `test_orphan_active_operation_after_crash` (P0-2) — process killed mid-external leaving an `active_operation_id`; on resume, `Store.recover` (Task 3.8) detects the orphan, classifies by `replay_policy`, and clears it (no manual rescue needed).
+- `test_second_begin_rejected_while_operation_active` (parallel P0-2) — while an operation is mid-external (active_operation_id set), a `begin_operation` for a **different** operation_id ⇒ hard-rejected with `ActiveOperationInProgress`; only (a) the same operation_id (idempotent re-entry) or (b) `Store.recover` may proceed.
+- `test_complete_rejected_while_review_external_phase_active` (parallel P0-2) — while `reviewer_review_task`'s external phase is running (state REVIEWING_TASK, active op set), `workflow_complete_task`'s begin ⇒ rejected (no racing into complete before review returns).
+- `test_begin_transition_has_recoverable_event_and_snapshot` (parallel P0-2) — begin writes a recoverable event + `state_after` snapshot (so a crash mid-external can reconstruct the intermediate state); not only finish writes events.
 
 **Implementation requirements:**
 `[CONTRACT]`
@@ -778,16 +787,20 @@ class OperationManager:
 class Store:
     def begin_operation(self, *, operation_id, request, tool, expected_revision,
                         intermediate_state, replay_policy) -> BeginResult
-        # under run_lock: ALLOWED_FROM[tool] check; CAS expected_revision == state.revision (PRE-begin);
+        # under run_lock:
+        #   HARD GATE (parallel P0-2): if state.active_operation_id is set AND != operation_id
+        #     -> raise ActiveOperationInProgress (only same-id re-entry or Store.recover may proceed)
+        #   ALLOWED_FROM[tool] check; CAS expected_revision == state.revision (PRE-begin);
         #   verify_locked_artifacts (gate nodes); write request; status PREPARED->RUNNING;
-        #   state -> intermediate_state WITH revision+1; set active_operation_id; generate lease_token;
-        #   write begin event/state_after; RETURN BeginResult; RELEASE lock
+        #   state -> intermediate_state WITH revision+1; set active_operation_id; store hash(lease_token);
+        #     generate lease_token; WRITE a recoverable begin event + state_after snapshot (parallel P0-2);
+        #   RETURN BeginResult; RELEASE lock
     def finish_operation(self, *, operation_id, lease_token, expected_revision, next_state,
                          staged_artifacts, result, promote=True) -> dict
-        # under run_lock: assert active_operation_id==operation_id & lease_token matches &
-        #   expected_revision == state.revision (== revision_after_begin); validate staged artifacts;
-        #   compute hashes over actual bytes; promote (Task 3.5, complete generation); append event;
-        #   replace state.json (revision+1 to next_state); status COMMITTED; clear active_operation_id; RELEASE lock
+        # under run_lock: assert active_operation_id==operation_id & hash(lease_token)==state.active_operation_lease
+        #   & expected_revision == state.revision (== revision_after_begin); validate staged artifacts;
+        #   compute hashes over actual bytes; promote (Task 3.5, single state.json commit); append finish event;
+        #   replace state.json (revision+1 to next_state); status COMMITTED; clear active_operation_id+lease; RELEASE lock
     def fail_operation(self, *, operation_id, lease_token, reason) -> dict
         # under run_lock: verify op+lease; status FAILED; state -> NEEDS_HUMAN (revision+1); event; clear active_operation_id
     def mark_unknown(self, *, operation_id, lease_token, reason) -> dict
@@ -801,48 +814,49 @@ class Store:
 **Expected:** 10 passed.
 **Commit message:** `feat: two-phase begin/finish with lease+revision semantics + fail/unknown paths (P0-3, P0-2)`
 
-### Task 3.5: Atomic promotion as complete logical snapshots + ArtifactResolver (P0-3, P1-4)
+### Task 3.5: Atomic promotion — state.json is the ONLY commit pointer + ArtifactResolver (P0-3, P1-4; parallel-review P0-1)
 
-**Goal:** fix the v2.1 gap where a new generation held only this operation's artifacts (so the previous SPEC vanished from the "current" view) and where some code read `control_root/SPEC.md` directly (so the pointer gave no real atomicity). Generations are now **complete logical snapshots**, and **all** reads go through one `ArtifactResolver`.
+**Goal:** fix three v2.1 gaps at once: (a) a new generation held only this operation's artifacts (so the previous SPEC vanished from the "current" view); (b) some code read `control_root/SPEC.md` directly (so the pointer gave no real atomicity); (c) **`current.json` and `state.json` were two independent pointers** — a crash between switching `current.json` and replacing `state.json` exposed "new artifacts + old state". The fix: **`state.json` is the single commit pointer**; it carries `artifact_generation`, so artifacts and state swap atomically in one `os.replace`. Generations are complete logical snapshots (Artifact Index mode); **all** reads go through one `ArtifactResolver`.
 
-**Depends on:** Task 3.4.
+**Depends:** Task 3.4.
 **Files:** extend `src/zcode_agentflow/store.py`; create `src/zcode_agentflow/artifacts.py` (generation store + `ArtifactResolver`); `tests/store/test_promotion.py`.
 
 **Tests first (`tests/store/test_promotion.py`):**
-- `test_new_generation_inherits_full_snapshot` (P0-3) — after draft (SPEC) then plan (PLAN+manifest) then verify (execution-result) then review (review-result), the current generation's manifest maps **all** of SPEC/PLAN/manifest/execution-result/review-result — not just the latest op's files.
-- `test_generation_replaces_only_changed_artifacts` — plan's generation copies forward the prior SPEC blob unchanged and only swaps PLAN/manifest.
-- `test_pointer_switch_is_atomic` — readers see either generation N or N+1, never a mix; a crash before the `current.json` switch leaves N fully visible.
-- `test_resolver_is_the_only_read_path` (P0-3) — `ArtifactResolver.read("SPEC.md")` returns the current generation's blob; assert **no** test/code path reads `control_root/SPEC.md` directly (enforced by a grep-style guard test on the codebase: only `artifacts.py`/`store.py` may touch authoritative paths).
-- `test_promotion_manifest_drives_idempotent_recovery` — per-file `{blob, sha256, promoted}`; recovery completes unpromoted items; verify each promoted blob's sha.
-- `test_crash_between_promotions_recovers_consistently` — crash mid-set ⇒ pointer unchanged ⇒ partial set invisible ⇒ recovery finishes or the generation is discarded.
+- `test_state_is_the_only_commit_pointer` (parallel P0-1) — `state.json` carries `artifact_generation`; there is **no** separate `current.json` that can diverge. Promotion writes the new generation's blobs + manifest, then **a single atomic `os.replace` of `state.json`** (with the new `artifact_generation` + new hashes) is the commit point.
+- `test_reader_never_observes_new_artifacts_with_old_state` (parallel P0-1) — inject a crash after blobs are written but before `state.json` replace; on resume, `ArtifactResolver(state)` resolves the **old** generation (old SPEC still visible), never a mix. Inject after `state.json` replace ⇒ new generation visible with matching new state.
+- `test_new_generation_inherits_full_snapshot` (P0-3) — after draft(SPEC) → plan(PLAN+manifest) → verify(execution-result) → review(review-result), the current generation's index maps **all** five logical names — not just the latest op's files.
+- `test_generation_replaces_only_changed_artifacts` — plan's generation index copies forward the prior SPEC blob ref unchanged and only swaps PLAN/manifest.
+- `test_resolver_is_the_only_read_path` (P0-3) — `ArtifactResolver(state).read("SPEC.md")` returns the current generation's blob; assert **no** code path reads `control_root/SPEC.md` directly (grep-style guard test: only `artifacts.py`/`store.py` may touch authoritative paths).
+- `test_promotion_index_drives_idempotent_recovery` — per-name `{blob, sha256}`; recovery verifies each blob's sha; a half-written generation (pre-state-replace) is invisible and discarded.
+- `test_crash_between_blob_writes_recovers_consistently` — crash mid-blob-write ⇒ state still points at the old generation ⇒ partial new generation is invisible ⇒ recovery discards it.
 
 **Implementation requirements:**
 `[CONTRACT]`
 ```
-# artifacts.py
+# artifacts.py  (Artifact Index mode — parallel-review recommended option B; minimal copying)
 @dataclass class Generation:
     generation_id: str
-    artifacts: dict[str, dict]     # {logical_name: {"blob": "blobs/<sha>", "sha256": "<sha>"}}
+    index: dict[str, dict]     # {logical_name: {"blob": "blobs/<sha>", "sha256": "<sha>"}}  -- COMPLETE map
 class ArtifactResolver:
-    def __init__(self, control_root): ...
-    def read(self, logical_name) -> bytes            # via current.json -> generation -> blobs/<sha>
+    def __init__(self, state): ...                       # reads state.artifact_generation
+    def _generation(self) -> Generation                  # loads artifacts/<state.artifact_generation>/manifest.json
+    def read(self, logical_name) -> bytes                # index[name].blob -> blobs/<sha>
     def read_text(self, logical_name) -> str
     def hash_of(self, logical_name) -> str
 # store.py
-def promote_artifacts(*, operation_id, changes: dict[str, bytes]) -> Generation
-    # 1. load current generation's artifact map (or empty for first)
-    # 2. for each (name, bytes) in changes: write blobs/<sha>; replace map[name]
-    #    (inherit all other names unchanged from the previous generation)
-    # 3. write the new generation dir + manifest (per-file promoted:false)
-    # 4. per-file mark promoted:true (os.replace into blobs is already atomic; this tracks visibility)
-    # 5. single atomic os.replace of current.json -> new generation_id
-def current_generation(control_root) -> Generation
+def promote_artifacts(*, operation_id, changes: dict[str, bytes], prev_state, next_state) -> None
+    # 1. build new index = copy of current generation's index (inherit ALL names)
+    # 2. for each (name, bytes) in changes: write blobs/<sha> (content-addressed); set index[name] = {blob, sha256}
+    # 3. write artifacts/<operation_id>/manifest.json (the new Generation) -- NOT yet committed
+    # 4. set next_state.artifact_generation = operation_id; next_state.*_sha256 = index[name].sha256
+    # 5. SINGLE atomic os.replace(state.json) with next_state  <-- THE ONLY COMMIT POINT (parallel P0-1)
+    # (no separate current.json switch; state IS the pointer)
 ```
-`[DATA]` generation manifest shape:
+`[DATA]` generation manifest (Artifact Index) shape:
 ```json
 {
   "generation_id": "<operation_id>",
-  "artifacts": {
+  "index": {
     "SPEC.md":              {"blob": "blobs/<sha>", "sha256": "<sha>"},
     "PLAN.md":              {"blob": "blobs/<sha>", "sha256": "<sha>"},
     "task-manifest.json":   {"blob": "blobs/<sha>", "sha256": "<sha>"},
@@ -851,11 +865,12 @@ def current_generation(control_root) -> Generation
   }
 }
 ```
-`[PSEUDO]` logical names are stable keys (`SPEC.md`, `PLAN.md`, `task-manifest.json`, `execution-result.json`, `review-result.json`); blobs are content-addressed (`blobs/<sha>`), so inheritance is just map copy. **All** engine reads (incl. `verify_locked_artifacts` in 6.1, `hash_file` checks in 6.2/6.3/6.6, Review Bundle assembly in 4.3) go through `ArtifactResolver`; the `hash_file(control_root/SPEC.md)` calls in earlier tasks are replaced by `resolver.hash_of("SPEC.md")` (this is the load-bearing P0-3 change — see task-rewrite notes below). Fault-injection fires after each per-file promotion (P1-4).
+`[DATA]` `state.json` gains an `artifact_generation` field (the generation_id of the currently-visible generation); the `*_sha256` fields are derived from that generation's index, so state and artifacts cannot diverge. `State.to_dict()`/load (Task 3.2) must carry `artifact_generation`.
+`[PSEUDO]` logical names are stable keys; blobs are content-addressed (`blobs/<sha>`), so inheritance is index copy (no blob duplication — parallel-review option B). **All** reads (`verify_locked_artifacts` 6.1, hash checks 6.2/6.3/6.6, Review Bundle 4.3, handoff 8.4, Stop hook 7.1, `workflow_status`) go through `ArtifactResolver(state)`. Fault-injection fires after each blob write and after the state replace (P1-4 + parallel P0-1).
 
 **Verification:** `python -m pytest tests/store/test_promotion.py -v`
-**Expected:** 6 passed.
-**Commit message:** `feat: complete-snapshot generations + single ArtifactResolver (P0-3, P1-4)`
+**Expected:** 7 passed.
+**Commit message:** `feat: state.json as sole commit pointer + Artifact Index + ArtifactResolver (P0-3, P1-4, parallel P0-1)`
 
 ### Task 3.6: Fault-injection recovery matrix across the two-phase flow (Prompt §3,§10)
 
@@ -951,32 +966,39 @@ def resume_active_run(user_data_root) -> RunPaths | None
 5. The three prompt templates exist, are tested for required placeholders, no leftover `{...}`, and correct content.
 6. Integration tests use **fake executables** asserting argv/stdin/cwd/output/timeout.
 
-### Task 4.0: Prompt templates (P0-2)
+### Task 4.0: Prompt templates (P0-2; parallel P1-2, P1-5)
 
-**Goal:** create + test the three prompt files the adapters/engine render. Resolves the v2-review gap where prompts had no task.
+**Goal:** create + test the three prompt files the adapters/engine render. Resolves the v2-review gap where prompts had no task. Use an **explicit `{{ var }}` placeholder syntax** with a per-template variable set (parallel P1-5: a generic "no `{...}` after render" rule false-positives on JSON examples/code braces in the prompt body). The resolved agent context is **inlined into the prompt sent via stdin** (parallel P1-2: Codex's cwd is the worktree under a read-only sandbox, so an external `control_root/resolved-agent-context.md` path may be unreadable).
 
-**Depends:** Tasks 2.1 (schema names), 2.7 (context invariants).
+**Depends:** Tasks 2.1 (schema names), 2.7 (context invariants), 5.3 (resolved agent context).
 **Files:** `prompts/planner-draft.md`, `prompts/planner-plan.md`, `prompts/reviewer.md`, `src/zcode_agentflow/prompts.py`, `tests/unit/test_prompts.py`.
 
 **Tests first (`tests/unit/test_prompts.py`):**
-- `test_all_required_placeholders_present` — each template contains its required placeholders (draft: `{goal}`, `{answers}`; plan: `{approved_spec_sha256}`, `{spec_markdown}`; reviewer: references the bundle files).
-- `test_render_leaves_no_unreplaced_placeholders` — after rendering with sample values, no residual `{...}` remains.
+- `test_all_required_placeholders_present` — each template contains its required `{{ var }}` placeholders (draft: `{{ goal }}`, `{{ answers }}`, `{{ agent_context }}`; plan: `{{ approved_spec_sha256 }}`, `{{ spec_markdown }}`, `{{ agent_context }}`; reviewer: references the bundle files).
+- `test_render_leaves_no_unreplaced_placeholders` — after rendering, no residual `{{ ... }}` remains; **but** literal `{` / `}` (e.g. in a JSON example in the prompt body) are **not** flagged (parallel P1-5: only `{{ }}` is a placeholder).
+- `test_unknown_variable_rejected` — passing a variable not in the template's allowed set ⇒ error (parallel P1-5: per-template variable sets).
 - `test_draft_template_emits_spec_only` — draft body instructs SPEC-only output (no plan).
 - `test_plan_template_requires_exactly_one_task` — plan body states "produce exactly ONE task; if the goal can't be one task, return BLOCKED" (ties to P0-5 wrapper).
 - `test_reviewer_references_bundle_files` — reviewer body names SPEC.md/PLAN.md/task-manifest.json/execution-result.json/diff.patch explicitly (P0-5/Grok context).
-- `test_templates_reference_resolved_agent_context` — each references `resolved-agent-context.md` (ties to Task 5.3).
+- `test_agent_context_is_inlined_not_external_path` (parallel P1-2) — the planner prompts inline `{{ agent_context }}` content into the stdin prompt; they do **not** instruct Codex to read an external `control_root/...` path (which may be outside its read-only sandbox). Grok's reviewer prompt may still reference the file inside its Review Bundle (which is assembled under its accessible dir).
 
 **Implementation requirements:**
-`[DATA]` template contents per the assertions above (SPEC-only for draft; one-task-or-BLOCKED for plan; bundle-file-referencing for reviewer; all reference resolved agent context).
+`[DATA]` template contents per the assertions above (SPEC-only for draft; one-task-or-BLOCKED for plan; bundle-file-referencing for reviewer). Placeholders use `{{ var }}`; each template declares its allowed variable set.
 `[CONTRACT]`
 ```
 # prompts.py
-def render(template_name, **fields) -> str   # raise on missing required placeholder; raise on leftover {...}
+TEMPLATE_VARS = {"planner-draft.md": {"goal","answers","agent_context"}, ...}   # per-template allowed set (parallel P1-5)
+def render(template_name, **fields) -> str
+    # verify every field in TEMPLATE_VARS[template_name] is supplied (no missing)
+    # verify no extra fields (no unknown vars)
+    # replace {{ var }} only; leave single braces alone (JSON/code in body untouched)
+    # raise if any {{ ... }} remains after substitution
 ```
+`[PSEUDO]` the engine reads `resolved-agent-context.md` (Task 5.3) and passes its content as the `agent_context` field, which the planner templates inline into the stdin prompt (parallel P1-2).
 
 **Verification:** `python -m pytest tests/unit/test_prompts.py -v`
-**Expected:** 6 passed.
-**Commit message:** `feat: prompt templates with placeholder + content tests (P0-2)`
+**Expected:** 7 passed.
+**Commit message:** `feat: prompt templates — {{ }} placeholders, inlined agent context (P0-2, parallel P1-2, P1-5)`
 
 ### Task 4.1: Adapter protocol + base + secret redaction (Prompt §12, §20)
 
@@ -1021,7 +1043,7 @@ def run_subprocess(cmd, *, stdin_text, cwd, timeout, operation_dir) -> tuple[int
 - `test_output_dir_is_operation_staging`.
 - `test_read_only_flag_present` (from capabilities).
 - `test_timeout_kills_process_tree`.
-- `test_result_validated_against_schema` — validates against spec-envelope **or** planner-result wrapper (P0-5) per the `kind`.
+- `test_result_validated_against_raw_schema` (parallel P0-4) — validates against the **raw** schema only (`spec-draft-output` for `kind=draft_spec`; `plan-proposal` for `kind=create_plan`); the raw output contains **no** authoritative fields (run_id/base_commit/hashes); the adapter returns the raw object to the engine, which injects authoritative fields and validates the FINAL schema (Task 6.2/6.3).
 
 **Implementation requirements:**
 `[CONTRACT]`
@@ -1031,7 +1053,7 @@ class CodexAdapter.invoke(self, *, request, repo_cwd, operation_dir, timeout) ->
     # request = {kind:"draft_spec"|"create_plan", prompt, schema_name, model, reasoning_effort, sandbox}
     # argv from capabilities.working_flags; stdin_text=prompt; cwd=repo_cwd; -o=operation_dir/out.json
 ```
-`[PSEUDO]` prompt/cwd/output_dir separate variables; `kind` explicit (not inferred from prompt text — Review §四.4). For `create_plan`, validate against the **planner-result wrapper** (so multi-task ⇒ BLOCKED cleanly, P0-5).
+`[PSEUDO]` prompt/cwd/output_dir separate variables; `kind` explicit (not inferred from prompt text — Review §四.4). The adapter validates the **raw** schema only (`validate_raw_spec` / `validate_raw_plan` — the model never emits run_id/base_commit/hashes) and returns the raw object; the engine injects authoritative fields and validates the FINAL schema (parallel P0-4). For `create_plan`, the raw `plan-proposal` wrapper makes multi-task ⇒ BLOCKED cleanly (P0-5).
 
 **Verification:** `python -m pytest tests/adapters/test_codex_fake_exe.py -v`
 **Expected:** 6 passed.
@@ -1044,27 +1066,28 @@ class CodexAdapter.invoke(self, *, request, repo_cwd, operation_dir, timeout) ->
 **Depends:** Tasks 4.0, 4.1, 2.1, 2.6 (gitops diff), Phase 0.
 **Files:** `src/zcode_agentflow/adapters/grok.py`, `src/zcode_agentflow/review_bundle.py`, `tests/adapters/test_grok_fake_exe.py`, `tests/adapters/_fakes/fake_grok.py`.
 
-**Tests first (fake executable):** `fake_grok.py` reads the bundle dir, asserts all files present+non-empty, writes a valid review-result.
+**Tests first (fake executable):** `fake_grok.py` reads the bundle dir, asserts all files present+non-empty, writes a valid **raw review-decision** (decision/compliance flags/issues/replan_required — **no** run_id/hashes/commits).
 - `test_bundle_contains_all_required_files` — SPEC/PLAN/manifest/execution-result/diff.patch/review-request/prompt.
 - `test_grok_output_cites_spec_and_plan`.
 - `test_readonly_flags_from_capabilities`.
 - `test_bundle_unchanged_after_call`.
 - `test_head_and_clean_checked_pre_and_post` — HEAD changed or dirty at call time ⇒ raise (→ NEEDS_HUMAN); re-check after.
-- `test_result_validated_against_review_schema_and_invariants`.
+- `test_result_validated_against_raw_review_schema` (parallel P0-4) — the adapter validates the **raw** `review-decision` schema + its cross-field invariants (PASS⇒no issues, etc.); it returns the raw decision to the engine, which injects run_id/task_id/commits/hashes and validates the FINAL `review-result`.
 
 **Implementation requirements:**
 `[CONTRACT]`
 ```
 # review_bundle.py
-def assemble(*, operation_dir, control_root, run_worktree_root, base_commit, head_commit, task, exec_result, resolved_agent_context) -> Path
+def assemble(*, operation_dir, resolver, run_worktree_root, base_commit, head_commit, task, exec_result, resolved_agent_context) -> Path
+    # reads SPEC/PLAN/manifest/execution-result via the ArtifactResolver (Task 3.5) -- not control_root root files
 # adapters/grok.py
-class GrokAdapter.invoke(...) -> AdapterResult   # flags from capabilities; validates review
+class GrokAdapter.invoke(...) -> AdapterResult   # flags from capabilities; validates RAW review-decision only
 ```
-`[PSEUDO]` review hash fields injected by engine from state (not trusted from Grok). Bundle assembled in staging, promoted by Store.
+`[PSEUDO]` the engine injects all authoritative fields (hashes/commits/run_id) from state and validates the FINAL review-result; Grok never emits them (parallel P0-4). Bundle assembled in staging (reading via resolver), promoted by Store.
 
 **Verification:** `python -m pytest tests/adapters/test_grok_fake_exe.py -v`
 **Expected:** 6 passed.
-**Commit message:** `feat: grok adapter + immutable Review Bundle (P0-5, Prompt §13)`
+**Commit message:** `feat: grok adapter + immutable Review Bundle, raw-decision validation (P0-5, Prompt §13, parallel P0-4)`
 
 ### Task 4.4: Verification adapter — structured, contained, script kinds, Windows-safe quoting (P1-1, P1-2, P1-5; Prompt §16)
 
@@ -1079,12 +1102,14 @@ class GrokAdapter.invoke(...) -> AdapterResult   # flags from capabilities; vali
   - `test_cwd_escape_rejected`, `test_program_not_in_config_allowlist_rejected` (P1-2), `test_nonzero_exit_recorded`, `test_secret_redaction_applied`, `test_timeout_kills_process_tree`.
   - `test_script_path_must_be_within_worktree`.
   - `test_network_policy_is_advisory_or_absent`.
-- `tests/adapters/test_cmd_quoting.py` (P1-1) — Windows `cmd.exe` injection defense:
-  - `test_cmd_script_rejects_metacharacters_in_args` — args containing `& | < > ^ % !` ⇒ rejected before launch (never passed to `cmd.exe /c`).
+- `tests/adapters/test_cmd_quoting.py` (P1-1, parallel P0-5) — Windows `cmd.exe` injection defense:
+  - `test_cmd_script_rejects_metacharacters_in_args` — args containing any of `& | < > ^ % ! ( )` (parallel P0-5 full set), CR/LF/NUL ⇒ rejected before launch (never passed to `cmd.exe /c`).
+  - `test_cmd_script_arg_whitelist_enforced` — every arg must match `^[A-Za-z0-9._:/\\=-]+$` (spaces disallowed by default; if a space policy is added later, the arg must pass a tested quoting helper) (parallel P0-5).
+  - `test_cmd_script_cannot_execute_second_command` — an arg like `T1 & del x` (or `T1\nrm y`) ⇒ rejected; assert only ONE command can ever run (parallel P0-5 attack test).
   - `test_cmd_script_never_concatenates_program_and_args` — the launcher builds a token list, never a single concatenated string; assert the argv shape.
   - `test_cmd_script_disables_delayed_expansion` — documented policy: `%VAR%`/`!VAR!` expansion is treated as unsafe and rejected (no reliance on `cmd /v`); a test with `%PATH%` in args is rejected.
-  - `test_cmd_script_quotes_args_safely` — a benign arg with spaces is passed as one token (Windows quoting applied), verified via a fake `cmd.exe` shim recording argv.
-  - `test_bash_script_rejects_shell_metacharacters` — `bash_script` args with `;`, `|`, `$()` ⇒ rejected.
+  - `test_cmd_script_quotes_args_safely` — a benign arg (whitelist-conformant) with a space, IF spaces are enabled, is passed as one token (Windows quoting applied), verified via a fake `cmd.exe` shim recording argv.
+  - `test_bash_script_rejects_shell_metacharacters` — `bash_script` args with `;`, `|`, `$()`, backtick ⇒ rejected.
 - `tests/adapters/test_script_kinds_platform.py` (P1-5):
   - `@pytest.mark.skipif(sys.platform!="win32")` on `cmd_script` Windows-only tests; `@pytest.mark.skipif(shutil.which("bash") is None)` on `bash_script` tests; a capability marker (from `docs/capabilities.json`) decides required/optional/unsupported per platform.
 
@@ -1092,22 +1117,27 @@ class GrokAdapter.invoke(...) -> AdapterResult   # flags from capabilities; vali
 `[CONTRACT]`
 ```
 # adapters/verification.py
-_CMD_META = set('&|<>^%!')     # rejected in cmd_script args (P1-1)
-_BASH_META = set(';$|&`')      # rejected in bash_script args
-def run_verification(*, command, worktree_root, config_allowlist, timeout) -> dict
+_CMD_META = set('&|<>^%!()')         # rejected in cmd_script args (P1-1, parallel P0-5; also CR/LF/NUL)
+_CMD_ARG_OK = r'^[A-Za-z0-9._:/\\=-]+$'   # whitelist (parallel P0-5); spaces off by default
+_BASH_META = set(';$|&`')            # rejected in bash_script args
+def run_verification(*, command, worktree_root, config_allowlist, interpreter_allowlist, timeout) -> dict
     # command.kind in {executable, cmd_script, bash_script}
-    # executable -> [program, *args]
-    # cmd_script -> reject if any arg intersects _CMD_META; build ["cmd.exe","/d","/s","/c", program, *args] (token list, shell=False)
-    # bash_script -> reject if any arg intersects _BASH_META; build ["bash", program, *args]
-    # cwd resolved+assert_within; program/script in config_allowlist (P1-2) AND script path within worktree
+    # executable -> program must be in config_allowlist; -> [program, *args]
+    # cmd_script -> program must be a .bat/.cmd under worktree; interpreter cmd.exe must be in interpreter_allowlist;
+    #               EACH arg must match _CMD_ARG_OK and not intersect _CMD_META (no CR/LF/NUL) -- parallel P0-5;
+    #               build ["cmd.exe","/d","/s","/c", program, *args] (token list, shell=False)
+    # bash_script -> program must be a .sh under worktree; interpreter bash must be in interpreter_allowlist;
+    #                 reject if any arg intersects _BASH_META; build ["bash", program, *args]
+    # cwd resolved+assert_within
 ```
-`[DATA]` config (Task 1.2) gains a structured allowlist — **not** parsed from Markdown:
+`[DATA]` config (Task 1.2) gains TWO distinct structured allowlists (parallel P1-3) — **not** parsed from Markdown:
 ```yaml
 verification:
-  program_allowlist: [python, pytest, npm]
-  network_policy: advisory_only      # never a fake "deny"
+  program_allowlist: [python, pytest, npm]      # for kind=executable (the program itself)
+  interpreter_allowlist: [cmd.exe, bash]        # for kind=cmd_script/bash_script (the interpreter)
+  network_policy: advisory_only                  # never a fake "deny"
 ```
-`[PSEUDO]` allowlist comes from `config["verification"]["program_allowlist"]`; AGENTS.md (Task 5.3) is context-only, never a security source (P1-2). If v1 doesn't support scripts, the schema/config **explicitly rejects** script kinds rather than claiming support. Windows quoting uses the standard `subprocess` list form (no manual string building); the metacharacter rejection is the primary defense since `cmd.exe /c` re-parses its command line (P1-1).
+`[PSEUDO]` allowlists come from config (P1-2); AGENTS.md (Task 5.3) is context-only, never a security source. **Two distinct rules** (parallel P1-3): `kind=executable` ⇒ `program` ∈ `program_allowlist`; `kind=cmd_script`/`bash_script` ⇒ script path ∈ worktree **and** interpreter (`cmd.exe`/`bash`) ∈ `interpreter_allowlist`. If v1 doesn't support scripts, the schema/config **explicitly rejects** script kinds rather than claiming support. Windows quoting uses the standard `subprocess` list form (no manual string building); the metacharacter + whitelist rejection is the primary defense since `cmd.exe /c` re-parses its command line (P1-1, parallel P0-5).
 
 **Verification:** `python -m pytest tests/adapters/test_verification.py tests/adapters/test_cmd_quoting.py tests/adapters/test_script_kinds_platform.py -v`
 **Expected:** all pass (platform-inappropriate tests skipped, not failed).
@@ -1456,25 +1486,28 @@ def workflow_complete_task(self, task_id, expected_revision) -> dict
 **Tests first (`tests/unit/test_pointer_lifecycle.py`):**
 - `test_workflow_init_sets_pointer_under_registry_lock` — `workflow_init` calls `set_pointer` under the Registry Lock (Task 1.3a); after init, `read_pointer` returns the new run.
 - `test_second_init_rejected_while_active_non_terminal` — a non-terminal active pointer ⇒ second `workflow_init` rejected unless explicit `abandon` (which itself clears the pointer under the Registry Lock).
-- `test_ready_to_merge_clears_pointer` — reaching `READY_TO_MERGE` via `workflow_complete_task` calls `clear_pointer` (or archives) under the Registry Lock; afterward `read_pointer` ⇒ None.
-- `test_abandon_clears_pointer_and_allows_new_run` — explicit abandon clears the pointer so a new run can start.
-- `test_pointer_only_mutated_under_registry_lock` — instrument the Registry Lock to assert every `set_pointer`/`clear_pointer` call occurs while it is held.
+- `test_ready_to_merge_marks_pointer_terminal_not_cleared` (parallel P0-3) — reaching `READY_TO_MERGE` via `workflow_complete_task` updates the pointer to `{run_id, state:"READY_TO_MERGE", terminal:true}` under the Registry Lock; it is **not** cleared. Afterward `workflow_status` still resolves this run and returns the READY_TO_MERGE handoff (the v2.1 "clear on terminal" bug made `workflow_status` return `{active_run:null}` and lost the final result).
+- `test_terminal_pointer_allows_new_run` — a `terminal:true` pointer does **not** block a new `workflow_init` (only non-terminal does); the new init overwrites the pointer under the Registry Lock.
+- `test_abandon_clears_pointer_and_allows_new_run` — explicit `abandon` clears the pointer so a new run can start.
+- `test_pointer_only_mutated_under_registry_lock` — instrument the Registry Lock to assert every `set_pointer`/`clear_pointer`/terminal-mark call occurs while it is held.
 
 **Implementation requirements:**
 `[CONTRACT]`
 ```
+# active_run.py (extend Task 1.3a primitives)
+def mark_pointer_terminal(user_data_root, run_id) -> None   # UNDER registry_lock; set {run_id, state:"READY_TO_MERGE", terminal:true}
 # engine.py
 def workflow_init(self, target_repo, goal, run_id=None) -> dict
     # ... init_run (Task 3.7) ... then set_pointer(user_data_root, run_id, control_root, target_repo_root) under registry_lock
 def workflow_complete_task(self, task_id, expected_revision) -> dict
-    # ... on reaching READY_TO_MERGE: clear_pointer(user_data_root) [or archive] under registry_lock
+    # ... on reaching READY_TO_MERGE: mark_pointer_terminal(user_data_root, run_id) under registry_lock (NOT clear)
 def abandon_run(self, run_id) -> dict     # explicit abandon: clear_pointer under registry_lock; allows a new init
 ```
-`[PSEUDO]` the pointer is the **only** source of "which run is active"; lifecycle mutations happen under the Registry Lock (P0-4); recovery of the pointer's run on restart is Task 3.8.
+`[PSEUDO]` the pointer is the **only** source of "which run is active"; lifecycle mutations happen under the Registry Lock (P0-4). A terminal pointer is retained so `workflow_status`/handoff can still read the final result; it is cleared only on new init / abandon / archive (parallel P0-3). Recovery of the pointer's run on restart is Task 3.8.
 
 **Verification:** `python -m pytest tests/unit/test_pointer_lifecycle.py -v`
-**Expected:** 5 passed.
-**Commit message:** `feat: active-run pointer lifecycle (init/READY_TO_MERGE/abandon) under registry lock (P0-1, P0-4)`
+**Expected:** 6 passed.
+**Commit message:** `feat: active-run pointer lifecycle — terminal-mark (not clear) on READY_TO_MERGE (P0-1, P0-4, parallel P0-3)`
 
 ---
 
@@ -1495,10 +1528,10 @@ def abandon_run(self, run_id) -> dict     # explicit abandon: clear_pointer unde
 **Files:** `hooks/<spike-confirmed>.json`, `hooks/protect_artifacts.py`, `hooks/gate_on_stop.py`, `src/zcode_agentflow/hook_logic.py`, `tests/unit/test_hook_logic.py`.
 
 **Tests first (`tests/unit/test_hook_logic.py`):** — driven by the captured payload shape (adapt if spike differed):
-- `test_protect_artifacts_denies_edit_of_spec_plan_state_events_reviews_approvals`.
+- `test_protect_artifacts_denies_edit_of_control_data` — denies edits to `state.json`, `events.jsonl`, `operations/*`, `approvals/*`, `reviews/*` (logical names **and** the physical generation store: `artifacts/*/*`, `blobs/*`) (parallel P1-1: with the Artifact Index design, the physical `artifacts/`+`blobs/` trees are authoritative too — protecting only logical names like SPEC.md leaves the real bytes editable).
 - `test_protect_artifacts_allows_worktree_edits`.
 - `test_protect_artifacts_resolves_plugin_root_via_spike_mechanism` — reaches plugin root via the spike-confirmed mechanism (env/cwd/manifest), not a hardcoded relative path (Review §六.7).
-- `test_gate_on_stop_calls_engine_check_stop` — invokes `check_stop(run_id)`, acts on `{allow_stop, reasons}`; does **not** re-derive review/clean/HEAD logic (Review §六.6).
+- `test_gate_on_stop_calls_engine_check_stop` — invokes `check_stop(run_id)` (which itself reads via ArtifactResolver, parallel P1-1), acts on `{allow_stop, reasons}`; does **not** re-derive review/clean/HEAD logic (Review §六.6).
 - `test_gate_on_stop_blocks_when_check_fails`.
 - `test_hook_respects_stop_reentry_limit` — escalates to NEEDS_HUMAN feedback past the cap instead of looping.
 
@@ -1731,6 +1764,23 @@ Phases are in **true topological order** (P0-6); an executing agent may proceed 
 | P1-4 raw log redaction order | P1 | **4.1** capture→redact→write (never raw-then-overwrite); `test_redaction_order.py`; raw debug log opt-in only |
 | P1-5 cross-platform tests need markers | P1 | **4.4** `@pytest.mark.skipif` + capability-driven required/optional/unsupported |
 
+## Appendix D3 — Parallel-review (v2.1) close matrix (this v2.2 revision)
+
+A second concurrent review of v2.1. Items overlapping D2 are noted; new items are closed here.
+
+| Parallel-review item | Overlap | Closed by (v2.2) |
+|---|---|---|
+| P0-1 current.json & state.json are two pointers (not single-point atomic) | **NEW** (D2 P0-3 covered snapshots, not the dual-pointer window) | **3.5** state.json is the sole commit pointer (carries `artifact_generation`); no separate current.json switch; `test_state_is_the_only_commit_pointer`, `test_reader_never_observes_new_artifacts_with_old_state` |
+| P0-2 Operation Lease + single-active-op hard gate | partial (D2 P0-2 had lease/fail; missing begin-gate + begin-event) | **3.4** begin-layer hard gate (`ActiveOperationInProgress`), begin writes recoverable event+snapshot; `test_second_begin_rejected_while_operation_active`, `test_complete_rejected_while_review_external_phase_active`, `test_begin_transition_has_recoverable_event_and_snapshot` |
+| P0-3 active-run pointer: Phase dependency + global lock + READY_TO_MERGE clears pointer | partial (D2 P0-1 split 1.3; P0-4 added Registry Lock; **terminal-clear bug new**) | **1.3a/3.8/6.8** + **6.8** pointer marked `terminal:true` (NOT cleared) on READY_TO_MERGE so `workflow_status`/handoff still resolve; cleared only on new init/abandon/archive |
+| P0-4 raw model-output vs final authoritative schema share one schema | **NEW** | **2.1** raw schemas (`spec-draft-output`/`plan-proposal`/`review-decision`, no authoritative fields) + final schemas (engine-injected); **4.2/4.3** adapters validate raw only; engine injects then validates final; never "overwrite-then-verify" |
+| P0-5 cmd_script injection (& | < > ^ % ! + parens/newline) | partial (D2 P1-1 covered basics; full set + whitelist new) | **4.4** `_CMD_META`=`&|<>^%!()` + CR/LF/NUL; `_CMD_ARG_OK` whitelist regex; `test_cmd_script_cannot_execute_second_command` |
+| P1-1 Resolver as universal read entry + Hook protects physical paths | partial (D2 had resolver; physical-path protection new) | **3.5** ArtifactResolver everywhere; **7.1** hook protects `artifacts/*`, `blobs/*`, `operations/*` physical trees, not just logical names |
+| P1-2 resolved-agent-context via external path (Codex sandbox unreadable) | **NEW** | **4.0** `{{ agent_context }}` inlined into the stdin prompt (not an external control_root path) |
+| P1-3 allowlist authoritative source + interpreter vs program split | partial (D2 moved to config; interpreter split new) | **4.4** `program_allowlist` (executable) vs `interpreter_allowlist` (cmd.exe/bash) in config |
+| P1-4 lock install uses lock file | same as D2 P1-3 | **1.1** `pip install -r requirements.lock && pip install -e . --no-deps` |
+| P1-5 `{...}` placeholder false-positive on JSON braces | **NEW** | **4.0** `{{ var }}` explicit syntax + per-template variable sets; single braces in JSON/code untouched |
+
 ## Appendix E — First-review (v1→v2) close matrix (still holds in v2.2)
 
 | First-review item | Closed by (v2.1) |
@@ -1811,6 +1861,19 @@ Run against the v2.1-review's must-fix list, the v2-review's must-fix list, and 
 | Generation pointer = complete snapshot + single read path | ✅ 3.5 complete logical snapshots + `ArtifactResolver` (only read path) |
 | Registry Lock for active-run pointer | ✅ 1.3a Registry Lock; 3.7 init; 6.8 lifecycle |
 | `.bat`/`.cmd` quoting, config allowlist, lock install, redaction order, platform markers | ✅ 4.4 / 1.2 / 1.1 / 4.1 / 4.4 |
+
+**Parallel-review (concurrent v2.1 review) must-fix — new gaps beyond D2:**
+
+| Must-fix (parallel-review) | Result |
+|---|---|
+| current.json vs state.json dual-pointer (not single-point atomic) | ✅ 3.5 state.json is the sole commit pointer (`artifact_generation`); no separate current.json switch |
+| begin-layer hard gate (single active op) + begin writes recoverable event/snapshot | ✅ 3.4 `ActiveOperationInProgress` gate + begin event/snapshot |
+| READY_TO_MERGE clears pointer (loses final status/handoff) | ✅ 6.8 pointer marked `terminal:true`, not cleared |
+| raw model-output schema ≠ final authoritative schema (validation no-op) | ✅ 2.1 raw/final split; 4.2/4.3 adapters validate raw; engine injects + validates final |
+| cmd_script injection (full metachar set + whitelist) | ✅ 4.4 `_CMD_META`+`_CMD_ARG_OK`; `test_cmd_script_cannot_execute_second_command` |
+| Hook protects physical artifact trees (not just logical names) | ✅ 7.1 protects `artifacts/*`,`blobs/*`,`operations/*` |
+| resolved-agent-context via stdin inline (Codex sandbox) | ✅ 4.0 `{{ agent_context }}` inlined |
+| `{...}` placeholder false-positive on JSON braces | ✅ 4.0 `{{ var }}` syntax + per-template var sets |
 
 **v2-review must-fix (held from prior revision):**
 
