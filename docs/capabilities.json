@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema#",
   "_phase": 0,
-  "_status": "PARTIAL — incremental; Tasks 0.1-0.4 confirmed, 0.5 pending",
+  "_status": "COMPLETE — all Phase 0 Tasks 0.1-0.5 confirmed; gates classified; versions pinned in requirements.lock.",
   "_discipline": "All facts here are backed by real Phase 0 spike runs, not model memory. Spike scripts/raw outputs live outside the repo (control_root). Every value cites its evidence.",
   "_evidence_control_root": "<repo-external temp dir; not committed>",
   "_sanitized": "No tokens, auth files, or sensitive absolute paths are committed; only sanitized command shapes, versions, and output structures.",
@@ -196,5 +196,72 @@
       "_critical": "Grok has NO automatic proxy injection (unlike codex's ~/.codex/.env). The Adapter MUST explicitly pass HTTP_PROXY/HTTPS_PROXY/ALL_PROXY=http://127.0.0.1:7897 in the subprocess env, otherwise the call HANGS indefinitely (network unreachable). This is a HARD contract for Phase 4 GrokAdapter."
     },
     "working_flags": ["-p \"<prompt>\"", "--cwd \"<absolute win path>\"", "--json-schema \"<inline json>\"", "--output-format json", "--permission-mode plan", "--always-approve"]
+  },
+
+  "gates": {
+    "_summary": "Capability gating (consumed by validate_capabilities in Phase 1). class semantics: required && value==false => startup fail; optional => never blocks; fallback-capable && value==false => allowed only if its fallback is acceptable per config; unknown => block.",
+    "planner_ok": {
+      "value": true,
+      "class": "required",
+      "evidence": "codex.stdin_prompt_works + read_only_held + cwd_is_repo + output_schema_works all true (Task 0.3)."
+    },
+    "reviewer_ok": {
+      "value": true,
+      "class": "required",
+      "evidence": "grok.readonly_flags + bundle_consumed + json_output_shape + cwd_vs_bundle_separated all true (Task 0.4)."
+    },
+    "tool_confirmation": {
+      "value": false,
+      "class": "fallback-capable",
+      "fallback": "non_adversarial_convention",
+      "evidence": "zcode.tool_confirmation.supported=true BUT configured as defaultMode=yolo/bypassPermissions in this env, so MCP-level mandatory confirmation is NOT enforced. The fallback is the convention-based approval flow (workflow_approve_spec gate node).",
+      "_config_key": "human_gates.spec_approval.allow_non_adversarial_fallback"
+    },
+    "reasoning_effort_high": {
+      "value": true,
+      "class": "fallback-capable",
+      "fallback": "medium",
+      "evidence": "codex.reasoning_effort_high_supported=true (--strict-config accepted 'high'). Fallback medium is the codex default and always available.",
+      "_note": "Even though high works, the gate stays fallback-capable so a future model/account without high can degrade to medium rather than block startup."
+    },
+    "mcp_stdio_server": {
+      "value": true,
+      "class": "required",
+      "evidence": "zcode.mcp_stdio + plugin_loaded + echo_tool_call all true (Task 0.1). The AgentFlow server is itself a FastMCP stdio server loaded the same way."
+    },
+    "hook_contract_known": {
+      "value": true,
+      "class": "required",
+      "evidence": "zcode.hooks: 6/7 events real-captured + full stdin dual-key structure + exit codes + cwd. PermissionRequest event confirmed (payload gap documented, does not block).",
+      "_note": "Required for Phase 7 (gate_on_stop / protect_artifacts hooks). No unknown remains that would block hook implementation."
+    },
+    "network_isolation": {
+      "value": false,
+      "class": "optional",
+      "note": "v1 advisory-only; true OS-level network isolation is out of scope. codex/grok run with proxy to reach model APIs; the sandbox flags (-s read-only / --permission-mode plan) provide FILESYSTEM read-only, not network isolation.",
+      "_note": "Threat model (Spec): MCP provides process-integrity, not defense against same-privilege malicious processes."
+    },
+    "proxy_required_for_external_llm": {
+      "value": true,
+      "class": "required",
+      "evidence": "grok hangs without explicit proxy env (HTTP(S)_PROXY=127.0.0.1:7897); codex injects its own via ~/.codex/.env. The Phase 4 adapters MUST pass proxy env to grok subprocess; codex works either way.",
+      "_note": "This is an environment finding, not a product feature. Documented so the Adapter does not assume env inheritance."
+    }
+  },
+
+  "phase0_exit": {
+    "phase": "0",
+    "result": "PASS (with one documented honesty gap)",
+    "exit_conditions_met": {
+      "1_echo_loadable": "Task 0.1 — echo tool called in real ZCode, returned {\"echo\":\"hello\"}",
+      "2_manifest_hook_captured": "Task 0.2 — manifest fields + 6/7 hook events + stdin shape + exit codes + cwd all real-captured",
+      "3_tool_confirmation_config": "Task 0.2 — confirmed supported=true, config_field=permissions.defaultMode, scope=global+per-tool; NOT a GUI switch",
+      "4_codex_observed": "Task 0.3 — stdin prompt, cwd=repo, read-only held, schema JSON output, reasoning effort high all confirmed",
+      "5_grok_observed": "Task 0.4 — read-only bundle consumed, parseable JSON output, bundle byte-identical after call",
+      "6_capabilities_committed": "Task 0.5 — docs/capabilities.json with versions + classified gates; requirements.lock; .gitignore extended"
+    },
+    "honesty_gaps": [
+      "PermissionRequest hook event: existence confirmed + same-source stdin structure inferred, but the REAL stdin payload was NOT captured because ZCode's hook runner runs in the interactive main session while the probe executed in an exec sub-session with no hook runner. Under yolo/bypass the event does not fire. This gap is documented in zcode.hooks.events_observed_real.PermissionRequest and does not block Phase 7 (the hook script will receive the standard tool-event stdin shape)."
+    ]
   }
 }

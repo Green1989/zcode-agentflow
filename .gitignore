@@ -56,3 +56,16 @@ $RECYCLE.BIN/
 *.pem
 *.key
 secrets.json
+
+# ---- Phase 0 spike / AgentFlow control_root (never committed) ----
+# Spike scripts, raw CLI outputs, hook logs, and the runtime control_root live
+# OUTSIDE the repo by design. These patterns guard against accidental inclusion.
+# IMPORTANT: do NOT add a broad `prompts/` rule (see AGENTS.md G1) — prompts are
+# source files here. These patterns target spike/control_root artifacts only.
+spike/
+**/spike-out/
+control_root/
+.agentflow-control/
+**/hooks.jsonl
+**/spike-*.jsonl
+**/bundle_checksums_*.txt
