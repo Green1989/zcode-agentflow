@@ -1,0 +1,46 @@
+# ZCode-AgentFlow — package metadata + build + tooling config
+#
+# Exact dependency versions are pinned in requirements.lock (the Phase 0 spike
+# contract, P1-7). The bounds here are compatible-release anchors so a fresh
+# `pip install -e .` stays close to validated versions; the authoritative
+# install procedure (Task 1.1, P1-3) installs the lock first, then the package
+# with --no-deps so pip cannot drift past the frozen versions:
+#
+#     pip install -r requirements.lock && pip install -e . --no-deps
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zcode-agentflow"
+version = "0.1.0"
+description = "ZCode-supervised AgentFlow: Codex planner + Grok reviewer, versioned-file handoff"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "ZCode-AgentFlow" }]
+# Compatible-release bounds anchored to the Phase 0 spike versions.
+# EXACT versions live in requirements.lock (the frozen contract).
+dependencies = [
+    "mcp~=1.8",
+    "portalocker~=2.10",
+    "jsonschema>=4.21",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest~=8.0",
+    "pytest-mock~=3.14",
+]
+
+[project.scripts]
+zcode-agentflow = "zcode_agentflow.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
