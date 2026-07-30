@@ -171,9 +171,14 @@ def test_crash_then_recover_is_consistent(tmp_path: Path, crash_env, crash_point
         # crash mid-flight with the run in the intermediate (or pre-begin) state:
         # the transition did NOT commit, so the op is classified UNKNOWN and the
         # COSTFUL_READ replay outcome is NEEDS_HUMAN (no auto-replay config).
-        assert recovered.state in ("INITIALIZING_WORKTREE", "DRAFTING_SPEC")
+        # recover advances a NEEDS_HUMAN-classified orphan's run state to
+        # NEEDS_HUMAN (a human must inspect the half-run op).
+        assert recovered.state in ("INITIALIZING_WORKTREE", "DRAFTING_SPEC", "NEEDS_HUMAN")
         assert op.status != "COMMITTED"
         assert fresh.last_recover_outcome() == "NEEDS_HUMAN"
+        # when the orphan's outcome is NEEDS_HUMAN, the run is surfaced as such
+        if recovered.state == "NEEDS_HUMAN":
+            assert recovered.active_operation_id is None
 
 
 # --------------------------------------------------------------------------- #

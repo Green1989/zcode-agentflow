@@ -816,6 +816,15 @@ class Store:
                 state.active_operation_id = None
                 state.active_operation_lease = None
                 self._last_recover_outcome = outcome
+                # If the orphan is NOT safely replayable, the run cannot proceed
+                # automatically -> advance to NEEDS_HUMAN (a human must inspect
+                # the half-run op). A REPLAY outcome leaves the run state as-is;
+                # the engine decides whether to replay (recover itself never
+                # re-invokes an adapter).
+                if outcome == "NEEDS_HUMAN" and state.state != "NEEDS_HUMAN":
+                    state.previous_state = state.state
+                    state.state = "NEEDS_HUMAN"
+                    state.revision = state.revision + 1
 
             # 3. persist the recovered state
             state.save(self.control_root)
