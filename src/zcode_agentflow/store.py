@@ -54,6 +54,9 @@ __all__ = [
     "TransitionNotAllowed",
     "CrashInjected",
     "StateCorruptError",
+    "InitRejected",
+    "InitNeedsHuman",
+    "init_run",
 ]
 
 STATE_FILENAME = "state.json"
@@ -85,6 +88,17 @@ class StateCorruptError(RuntimeError):
     it cannot be rebuilt from the latest event's snapshot (snapshot missing or
     its sha mismatches). Recovery surfaces this so a human decides — it never
     silently picks another run (Task 3.8 enforces pointer-scoped recovery)."""
+
+
+class InitRejected(RuntimeError):
+    """Raised by :func:`init_run` when a non-terminal active-run pointer already
+    exists (a second workflow_init would collide). The user must abandon first."""
+
+
+class InitNeedsHuman(RuntimeError):
+    """Raised by :func:`init_run` when a half-created worktree exists but its
+    branch ownership does NOT match this run (a foreign collision), or the
+    worktree state is otherwise unrecoverable. No destructive auto-cleanup."""
 
 
 class OperationConflict(RuntimeError):
@@ -898,6 +912,181 @@ class Store:
         rebuilt = State.from_dict(json.loads(snap_path.read_bytes()))
         rebuilt.save(self.control_root)
         return rebuilt
+
+
+# ===========================================================================
+# Transactional workflow_init (Task 3.7; Prompt §11, P0-4, errata)
+#
+# init_run owns the run-creation critical section inside ONE registry-lock
+# block (errata #5: this task is the SOLE owner of the initial pointer write;
+# Task 6.8 delegates here and does NOT repeat it). It:
+#   1. asserts a new run is allowed (no non-terminal active pointer);
+#   2. runs preflight (git repo, no in-progress merge, roots non-nesting, no
+#      branch/worktree collision);
+#   3. seeds the NEW state.json, then begin_operation (NEW -> INITIALIZING_WORKTREE)
+#      — a half-created worktree from a crashed prior attempt is CLAIMED if its
+#      branch ownership matches this run, else InitNeedsHuman (NEVER auto-remove);
+#   4. gitops.create_worktree (journal branch);
+#   5. finish_operation (state=INITIALIZING_WORKTREE, base_commit) — the single
+#      commit point;
+#   6. writes the active-run pointer under the SAME registry lock.
+# No destructive compensation: a half-created worktree is never auto-removed.
+# ===========================================================================
+
+
+def init_run(*, user_data_root, target_repo, control_root, worktree_root,
+             run_id, plugin_root, goal) -> dict:
+    """Create a run transactionally: preflight -> begin/worktree/finish ->
+    set the active pointer. Returns ``{run_id, base_commit, ...}``.
+
+    Holds the Registry Lock across the whole critical section (pointer +
+    allocation). The Per-Run lock is taken only across the begin/finish
+    bookkeeping (by ``Store.begin_operation``/``finish_operation``); the
+    ``gitops.create_worktree`` call runs between them, Per-Run-lock-free.
+    """
+    from zcode_agentflow import active_run as _active_run
+    from zcode_agentflow import gitops as _gitops
+    from zcode_agentflow import preflight as _preflight
+
+    control_root = Path(control_root)
+    worktree_root = Path(worktree_root)
+    # git worktree add -b takes a SHORT branch name; the full ref is
+    # refs/heads/<short>. We keep both: short for git ops, full for comparisons.
+    branch_short = f"agentflow/{run_id}"
+    branch = f"refs/heads/{branch_short}"
+
+    with _active_run.ActiveRunRegistry.locked(user_data_root) as registry:
+        # 1. only one active run at a time (P0-4). Surface a registry rejection
+        # as InitRejected so callers can distinguish "blocked by an active run"
+        # from an environment preflight failure.
+        try:
+            registry.assert_new_run_allowed_locked()
+        except RuntimeError as exc:
+            raise InitRejected(str(exc)) from exc
+
+        # 2. preflight (read-only environment check)
+        _preflight.preflight(
+            target_repo=target_repo, control_root=control_root,
+            worktree_root=worktree_root, branch=branch,
+        )
+
+        # 3. seed the NEW state.json for this run, then begin the init op.
+        control_root.mkdir(parents=True, exist_ok=True)
+        fresh = State(
+            run_id=run_id, revision=1, state="NEW", previous_state="",
+            plan_version=1, current_task="", completed_tasks=[],
+            roots={
+                "plugin_root": str(Path(plugin_root)),
+                "target_repo_root": str(Path(target_repo)),
+                "run_worktree_root": str(worktree_root),
+                "control_root": str(control_root),
+            },
+        )
+        fresh.save(control_root)
+
+        s = Store(control_root)
+        op_id = f"{run_id}__workflow_init__r1__a1"
+
+        # Worktree recovery: if the worktree path already exists, a prior init
+        # attempt crashed after `git worktree add` before finish. CLAIM it iff
+        # its branch ownership matches this run; else InitNeedsHuman. We NEVER
+        # auto-remove (no destructive compensation).
+        wt_created = False
+        base_commit = None
+        if worktree_root.exists() and any(worktree_root.iterdir()):
+            _claim_or_raise(target_repo, worktree_root, branch)
+            # the worktree is ours and already on `branch`; reuse its base commit
+            base_commit = _gitops.head(target_repo)
+            wt_created = True  # treat as already done; skip create below
+        else:
+            base_commit = _gitops.head(target_repo)
+
+        # begin the init transaction (NEW -> INITIALIZING_WORKTREE). This takes
+        # the Per-Run lock for a short bookkeeping step.
+        br = s.begin_operation(
+            operation_id=op_id,
+            request={"tool": "workflow_init", "args": {"target_repo": str(target_repo), "goal": goal}},
+            tool="workflow_init",
+            expected_revision=State.load(control_root).revision,
+            intermediate_state="INITIALIZING_WORKTREE",
+            replay_policy="UNSAFE_WRITE",  # worktree creation has side effects
+        )
+
+        try:
+            # external-ish step (Per-Run-lock-free): create the worktree if we
+            # did not claim an existing one.
+            if not wt_created:
+                _gitops.create_worktree(
+                    target_repo=target_repo, worktree_path=worktree_root, branch=branch_short,
+                )
+            # fault-injection checkpoint: crash here simulates a process kill
+            # after the worktree exists but before finish commits.
+            _crash_checkpoint("init_after_worktree_add")
+
+            s.finish_operation(
+                operation_id=op_id,
+                lease_token=br.lease_token,
+                expected_revision=br.revision_after_begin,
+                next_state="INITIALIZING_WORKTREE",
+                staged_artifacts={},
+                result={"worktree": str(worktree_root)},
+            )
+            # record base_commit on the committed state
+            committed = State.load(control_root)
+            committed.base_commit = base_commit
+            committed.save(control_root)
+        except CrashInjected:
+            raise
+        except BaseException:
+            # any non-crash failure during init: surface as InitNeedsHuman
+            # (the half-created worktree is left in place for a human).
+            raise InitNeedsHuman(
+                f"workflow_init for run {run_id!r} failed mid-transaction; "
+                f"worktree may be half-created at {worktree_root} (NOT auto-removed)"
+            )
+
+        # 6. write the active-run pointer under the SAME registry lock (errata:
+        # this task is the sole owner of the initial pointer write).
+        registry.set_pointer_locked(
+            run_id=run_id, control_root=control_root, target_repo_root=target_repo,
+        )
+
+    return {
+        "run_id": run_id,
+        "base_commit": base_commit,
+        "control_root": str(control_root),
+        "worktree_root": str(worktree_root),
+        "branch": branch,
+    }
+
+
+def _claim_or_raise(target_repo, worktree_root, branch) -> None:
+    """If ``worktree_root`` is an existing worktree of ``target_repo`` whose
+    branch IS ``branch``, claim it (no-op — it's ours). Otherwise raise
+    :class:`InitNeedsHuman` (foreign collision; never auto-remove)."""
+    from zcode_agentflow import gitops as _gitops
+
+    branch_short = branch.split("refs/heads/", 1)[-1]
+    owner_branch = None
+    for wt in _gitops.worktree_list(target_repo):
+        wpath = wt.get("path")
+        if wpath:
+            try:
+                if Path(wpath).resolve() == Path(worktree_root).resolve():
+                    owner_branch = wt.get("branch")
+                    break
+            except OSError:
+                continue
+    # git records the branch as refs/heads/... or bare short name depending on
+    # version; accept either form.
+    owner_short = (owner_branch or "").split("refs/heads/", 1)[-1]
+    if owner_short != branch_short:
+        raise InitNeedsHuman(
+            f"worktree path {worktree_root} exists but is owned by branch "
+            f"{owner_branch!r}, not this run's branch {branch!r} (foreign "
+            f"collision); refusing to overwrite — needs human"
+        )
+    # owner matches -> claim (no destructive action)
 
 
 # ===========================================================================
