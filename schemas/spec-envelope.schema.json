@@ -1,0 +1,45 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "spec-envelope.schema.json",
+  "title": "spec-envelope (FINAL, engine-assembled)",
+  "description": "Engine-assembled = RAW spec-draft-output + injected authoritative fields (run_id, status). The engine validates this AFTER injecting run_id/status from state. (Task 2.1, parallel P0-4.)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["run_id", "status", "goal", "spec_markdown", "questions", "assumptions"],
+  "properties": {
+    "run_id": { "$ref": "#/definitions/runId" },
+    "status": { "type": "string", "enum": ["NEEDS_USER_INPUT", "READY_FOR_SPEC_APPROVAL"] },
+    "goal": { "type": "string", "minLength": 1 },
+    "spec_markdown": { "type": "string", "minLength": 1 },
+    "questions": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "assumptions": {
+      "type": "array",
+      "items": { "$ref": "spec-draft-output.schema.json#/definitions/assumption" }
+    }
+  },
+  "definitions": {
+    "runId": {
+      "type": "string",
+      "pattern": "^\\d{14}-[0-9a-f]{6}$",
+      "description": "run id: 14-digit timestamp + 6 hex chars"
+    },
+    "taskId": {
+      "type": "string",
+      "pattern": "^T[0-9]{3}(-R[0-9]+)?$",
+      "description": "task id: T000 / T000-R0 form"
+    },
+    "hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$",
+      "description": "SHA-256 hex (lowercase, 64 chars) — MCP-computed, never trusted from the model"
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{7,40}$",
+      "description": "git commit hash (7..40 hex)"
+    }
+  }
+}

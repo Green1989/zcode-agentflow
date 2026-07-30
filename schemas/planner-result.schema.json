@@ -1,0 +1,37 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "planner-result.schema.json",
+  "title": "planner-result (FINAL wrapper, engine-assembled)",
+  "description": "FINAL form of the planner-result wrapper (P0-5). Engine-assembled: the RAW plan-proposal wrapper plus injected authoritative fields (run_id, base_commit, plan_version). Mirrors plan-proposal's status enum but, when status==READY_FOR_EXECUTION, carries a strict single-task FINAL plan-envelope (with base_commit). The engine injects authoritative fields then validates. (Task 2.1, P0-5.)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "run_id"],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["READY_FOR_EXECUTION", "NEEDS_USER_INPUT", "BLOCKED"]
+    },
+    "run_id": { "$ref": "spec-envelope.schema.json#/definitions/runId" },
+    "plan_version": { "type": "integer", "minimum": 1 },
+    "plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["plan_markdown", "base_commit", "tasks"],
+      "properties": {
+        "plan_markdown": { "type": "string", "minLength": 1 },
+        "base_commit": { "$ref": "spec-envelope.schema.json#/definitions/commit" },
+        "tasks": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": { "$ref": "plan-envelope.schema.json#/definitions/task" }
+        }
+      }
+    },
+    "questions": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "block_reason": { "type": "string", "minLength": 1 }
+  }
+}

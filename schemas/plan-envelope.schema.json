@@ -1,0 +1,52 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "plan-envelope.schema.json",
+  "title": "plan-envelope (FINAL, engine-assembled)",
+  "description": "Engine-assembled = single-task plan + injected authoritative fields (run_id, base_commit, plan_version). Strict single-task (minItems:1, maxItems:1). The FINAL envelope is what lands on disk; the RAW plan-proposal (without base_commit/run_id) is what the model emits. (Task 2.1, parallel P0-4.)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["run_id", "status", "plan_markdown", "plan_version", "base_commit", "tasks"],
+  "properties": {
+    "run_id": { "$ref": "spec-envelope.schema.json#/definitions/runId" },
+    "status": { "type": "string", "enum": ["READY_FOR_EXECUTION"] },
+    "plan_markdown": { "type": "string", "minLength": 1 },
+    "plan_version": { "type": "integer", "minimum": 1 },
+    "base_commit": { "$ref": "spec-envelope.schema.json#/definitions/commit" },
+    "tasks": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "items": { "$ref": "#/definitions/task" }
+    }
+  },
+  "definitions": {
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "title", "dependencies", "declared_files",
+                   "verification_commands", "acceptance_criteria", "planned_changes"],
+      "properties": {
+        "id": { "$ref": "spec-envelope.schema.json#/definitions/taskId" },
+        "title": { "type": "string", "minLength": 1 },
+        "dependencies": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "declared_files": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "verification_commands": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "plan-proposal.schema.json#/definitions/verificationCommand" }
+        },
+        "acceptance_criteria": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "planned_changes": { "$ref": "plan-proposal.schema.json#/definitions/plannedChanges" }
+      }
+    }
+  }
+}

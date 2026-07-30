@@ -1,0 +1,61 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "execution-result.schema.json",
+  "title": "execution-result (FINAL, engine-assembled)",
+  "description": "Engine-assembled from Git + test runs (workflow_verify_task). change_audit.dependency_files_changed is a BOOLEAN (Review §六.9 — never a string). Generated only after the task commit, worktree clean, no untracked files. (Task 2.1.)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["run_id", "task_id", "status", "base_commit", "head_commit",
+               "worktree_clean", "untracked_files", "verification",
+               "changed_files", "change_audit"],
+  "properties": {
+    "run_id": { "$ref": "spec-envelope.schema.json#/definitions/runId" },
+    "task_id": { "$ref": "spec-envelope.schema.json#/definitions/taskId" },
+    "status": { "type": "string", "enum": ["READY_FOR_REVIEW", "VERIFICATION_FAILED", "NEEDS_HUMAN"] },
+    "base_commit": { "$ref": "spec-envelope.schema.json#/definitions/commit" },
+    "head_commit": { "$ref": "spec-envelope.schema.json#/definitions/commit" },
+    "worktree_clean": { "type": "boolean" },
+    "untracked_files": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "verification": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["command", "exit_code", "duration_ms"],
+        "properties": {
+          "command": { "type": "string", "minLength": 1 },
+          "exit_code": { "type": "integer" },
+          "duration_ms": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "changed_files": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "change_audit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deleted_files", "dependency_files_changed",
+                   "migrations_added", "undeclared_files_changed"],
+      "properties": {
+        "deleted_files": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "dependency_files_changed": { "type": "boolean" },
+        "migrations_added": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "undeclared_files_changed": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    }
+  }
+}

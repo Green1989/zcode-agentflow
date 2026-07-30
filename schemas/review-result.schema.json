@@ -1,0 +1,31 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "review-result.schema.json",
+  "title": "review-result (FINAL, engine-assembled)",
+  "description": "Engine-assembled = RAW review-decision + injected authoritative context (run_id, task_id, base_commit, head_commit, spec_sha256, plan_sha256, task_manifest_sha256, plan_version). All hashes are 64-char lowercase hex (MCP-computed, never trusted from the model). The cross-field invariants on decision/issues/replan still hold on the FINAL envelope. (Task 2.1, parallel P0-4.)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["run_id", "task_id", "base_commit", "head_commit",
+               "spec_sha256", "plan_sha256", "task_manifest_sha256", "plan_version",
+               "decision", "spec_compliance", "plan_compliance",
+               "tests_sufficient", "issues", "replan_required"],
+  "properties": {
+    "run_id": { "$ref": "spec-envelope.schema.json#/definitions/runId" },
+    "task_id": { "$ref": "spec-envelope.schema.json#/definitions/taskId" },
+    "base_commit": { "$ref": "spec-envelope.schema.json#/definitions/commit" },
+    "head_commit": { "$ref": "spec-envelope.schema.json#/definitions/commit" },
+    "spec_sha256": { "$ref": "spec-envelope.schema.json#/definitions/hash" },
+    "plan_sha256": { "$ref": "spec-envelope.schema.json#/definitions/hash" },
+    "task_manifest_sha256": { "$ref": "spec-envelope.schema.json#/definitions/hash" },
+    "plan_version": { "type": "integer", "minimum": 1 },
+    "decision": { "type": "string", "enum": ["PASS", "FAIL", "REPLAN", "BLOCKED"] },
+    "spec_compliance": { "type": "boolean" },
+    "plan_compliance": { "type": "boolean" },
+    "tests_sufficient": { "type": "boolean" },
+    "issues": {
+      "type": "array",
+      "items": { "$ref": "review-decision.schema.json#/definitions/issue" }
+    },
+    "replan_required": { "type": "boolean" }
+  }
+}

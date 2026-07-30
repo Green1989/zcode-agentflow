@@ -1,0 +1,42 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "review-decision.schema.json",
+  "title": "review-decision (RAW, model-emitted)",
+  "description": "What Grok emits from reviewer_review_task. RAW: FORBIDS authoritative fields (run_id, task_id, base_commit, head_commit, hashes, plan_version) — the engine injects those into the FINAL review-result. Only the decision + the review substance. Cross-field invariants (decision/issues/replan consistency) are enforced by validate_raw_review. (Task 2.1, parallel P0-4.)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["decision", "spec_compliance", "plan_compliance",
+               "tests_sufficient", "issues", "replan_required"],
+  "properties": {
+    "decision": { "type": "string", "enum": ["PASS", "FAIL", "REPLAN", "BLOCKED"] },
+    "spec_compliance": { "type": "boolean" },
+    "plan_compliance": { "type": "boolean" },
+    "tests_sufficient": { "type": "boolean" },
+    "issues": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/issue" }
+    },
+    "replan_required": { "type": "boolean" }
+  },
+  "definitions": {
+    "issue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "severity", "category", "file", "line",
+                   "description", "required_action"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "severity": { "type": "string", "enum": ["low", "medium", "high", "critical"] },
+        "category": {
+          "type": "string",
+          "enum": ["correctness", "security", "performance", "maintainability",
+                   "tests", "spec_compliance", "plan_compliance", "other"]
+        },
+        "file": { "type": "string", "minLength": 1 },
+        "line": { "type": "integer", "minimum": 1 },
+        "description": { "type": "string", "minLength": 1 },
+        "required_action": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

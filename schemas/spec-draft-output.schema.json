@@ -1,0 +1,34 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "spec-draft-output.schema.json",
+  "title": "spec-draft-output (RAW, model-emitted)",
+  "description": "What Codex actually emits from planner_draft_spec. This is the RAW schema: it FORBIDS authoritative fields (run_id, status, spec_sha256) — those are injected by the engine into the FINAL spec-envelope. additionalProperties:false so the model cannot sneak in extra fields. (Task 2.1, parallel P0-4.)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["goal", "spec_markdown", "questions", "assumptions"],
+  "properties": {
+    "goal": { "type": "string", "minLength": 1 },
+    "spec_markdown": { "type": "string", "minLength": 1 },
+    "questions": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "assumptions": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/assumption" }
+    }
+  },
+  "definitions": {
+    "assumption": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "assumption", "risk", "default"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "assumption": { "type": "string", "minLength": 1 },
+        "risk": { "type": "string", "enum": ["low", "medium", "high"] },
+        "default": { "type": "string" }
+      }
+    }
+  }
+}
