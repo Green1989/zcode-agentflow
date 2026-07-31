@@ -41,8 +41,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from zcode_agentflow import (
+    agents_context,
     artifacts,
     gitops,
+    ids,
+    prompts,
+    schemas,
     store,
 )
 from zcode_agentflow.artifacts import ArtifactResolver
@@ -175,6 +179,210 @@ class Engine:
     def _resolver(self, state=None) -> ArtifactResolver:
         st = state if state is not None else self._load_state()
         return ArtifactResolver(self.roots.control_root, st)
+
+    # ------------------------------------------------------------------
+    # Operation-id helpers (Task 6.2; Prompt §15; Review §二)
+    # ------------------------------------------------------------------
+
+    def _next_attempt(self, tool: str, revision: int) -> int:
+        """Derive the next attempt counter for (run, tool, revision) from disk.
+
+        The operations directory is the durable record of past attempts. We count
+        existing op dirs whose id matches ``<run_id>__<tool>__r<revision>__a<n>``
+        and return max+1, so a re-entry auto-gets a FRESH id (never a replay of a
+        prior committed op). Starts at 1 when none exist.
+        """
+        prefix = f"{self._run_id()}__{tool}__r{revision}__a"
+        ops_dir = Path(self.roots.control_root) / store.OPS_DIRNAME
+        if not ops_dir.is_dir():
+            return 1
+        best = 0
+        for p in ops_dir.iterdir():
+            name = p.name
+            if name.startswith(prefix):
+                tail = name[len(prefix):]
+                if tail.isdigit():
+                    best = max(best, int(tail))
+        return best + 1
+
+    def _run_id(self) -> str:
+        return self._load_state().run_id
+
+    def _op_id(self, tool: str, revision: int, attempt: int | None = None) -> str:
+        a = attempt if attempt is not None else self._next_attempt(tool, revision)
+        return ids.operation_id(
+            run_id=self._run_id(), tool=tool, revision=revision, attempt=a
+        )
+
+    # ------------------------------------------------------------------
+    # Agent context (Task 5.3) — resolved once per run, read from control_root.
+    # ------------------------------------------------------------------
+
+    def _resolved_agent_context(self) -> str:
+        """Resolve (or read) the agent context for this run and return its text.
+
+        ``agents_context.resolve`` composes the repo AGENTS.md + the plugin
+        template and writes ``control_root/resolved-agent-context.md``. It is
+        idempotent (byte-identical on repeat). We resolve here so the inlined
+        context is fresh for each planner/reviewer call (Prompt §19).
+        """
+        path = agents_context.resolve(
+            target_repo=self.roots.target_repo_root,
+            plugin_root=self.roots.plugin_root,
+            control_root=self.roots.control_root,
+        )
+        return path.read_text(encoding="utf-8")
+
+    # ==================================================================
+    # Tool 1: workflow_init (wraps store.init_run — Task 3.7 owns the pointer)
+    # ==================================================================
+
+    def workflow_init(self, *, target_repo: str, goal: str,
+                      run_id: str | None = None) -> dict:
+        """NEW → INITIALIZING_WORKTREE. Delegates to ``store.init_run`` (Task 3.7),
+        which owns the registry critical section + the initial active-run pointer
+        write (errata: workflow_init does NOT write the pointer itself — no double
+        write). Returns ``{run_id, base_commit, control_root, worktree_root,
+        branch}``.
+
+        ``run_id`` is generated when not supplied (Phase 1 ids.new_run_id). The
+        worktree is created OUTSIDE the repo (Spec §2.2 four-roots).
+        """
+        rid = run_id or ids.new_run_id()
+        # control_root / worktree_root live under a per-run subdir of the
+        # control/worktree bases derived from the roots the Engine was built with.
+        # init_run takes absolute control_root + worktree_root paths.
+        return store.init_run(
+            user_data_root=self.user_data_root,
+            target_repo=target_repo,
+            control_root=self.roots.control_root,
+            worktree_root=self.roots.run_worktree_root,
+            run_id=rid,
+            plugin_root=self.roots.plugin_root,
+            goal=goal,
+        )
+
+    # ==================================================================
+    # Tool 2: planner_draft_spec (answers re-entry; Review §二; Prompt §15)
+    # ==================================================================
+
+    def planner_draft_spec(self, *, goal: str, answers: str | None = None,
+                           expected_revision: int | None = None) -> dict:
+        """INITIALIZING_WORKTREE/NEEDS_USER_INPUT → DRAFTING_SPEC →
+        (questions non-empty → NEEDS_USER_INPUT | empty → READY_FOR_SPEC_APPROVAL).
+
+        begin → CodexAdapter (no lock) → finish. The op id is revision/attempt-
+        bound so re-entry with answers gets a FRESH id (never a replay). The raw
+        spec-draft is RAW-validated by the adapter; here we inject run_id + status
+        from state and validate the FINAL spec-envelope (Task 2.7). SPEC.md is
+        promoted as a new generation; ``state.spec_sha256 = resolver.hash_of``.
+        """
+        from zcode_agentflow.adapters.codex import CodexAdapter
+
+        state = self._load_state()
+        rev = state.revision
+        # expected_revision defaults to the current revision (the CAS the caller
+        # must have observed). The Store compares it inside begin.
+        if expected_revision is None:
+            expected_revision = rev
+        op_id = self._op_id("planner_draft_spec", rev)
+
+        # resolve agent context (inlined into the stdin prompt — never a path).
+        agent_context = self._resolved_agent_context()
+        prompt = prompts.render(
+            "planner-draft.md",
+            goal=goal,
+            answers=answers or "",
+            agent_context=agent_context,
+        )
+        request = {
+            "kind": "draft_spec",
+            "prompt": prompt,
+            "goal": goal,
+            "answers": answers,
+            "state": state.state,
+            "expected_revision": expected_revision,
+            # shipped RAW schema constrains the model's final answer
+            "schema_path": str(schemas.SCHEMAS_DIR / "spec-draft-output.schema.json"),
+        }
+
+        br = self._begin(
+            tool="planner_draft_spec", operation_id=op_id, request=request,
+            expected_revision=expected_revision,
+            intermediate_state="DRAFTING_SPEC", replay_policy="COSTFUL_READ",
+        )
+        try:
+            codex = self.adapters.get("codex") or CodexAdapter()
+            result = codex.invoke(
+                request=request, repo_cwd=self.roots.run_worktree_root,
+                operation_dir=br.staging_dir,
+                timeout=self._adapter_timeout("planner"),
+            )
+            if result.exit_code != 0 or result.parsed is None:
+                raise WorkflowError(
+                    f"planner_draft_spec adapter failed (exit={result.exit_code})"
+                )
+            raw = result.parsed
+            # build the FINAL spec envelope: inject run_id + status from the
+            # questions (non-empty => NEEDS_USER_INPUT; empty => READY_FOR_SPEC_APPROVAL).
+            questions = list(raw.get("questions", []))
+            final_status = "NEEDS_USER_INPUT" if questions else "READY_FOR_SPEC_APPROVAL"
+            final = {
+                "run_id": state.run_id,
+                "status": final_status,
+                # the run's goal (the caller's) is authoritative, NOT the model's
+                # echo — the FINAL envelope carries exactly the run goal so the
+                # context invariant (final.goal == run goal) holds (Task 2.7).
+                "goal": goal,
+                "spec_markdown": raw["spec_markdown"],
+                "questions": questions,
+                "assumptions": raw.get("assumptions", []),
+            }
+            schemas.check_spec_context(final, run_id=state.run_id, goal=goal)
+            # persist the FINAL envelope as the op's out.json (the adapter wrote
+            # the RAW; the authoritative FINAL is what the engine assembles).
+            (Path(br.staging_dir) / "out.json").write_text(
+                json.dumps(final, ensure_ascii=False), encoding="utf-8"
+            )
+
+            next_state = "NEEDS_USER_INPUT" if questions else "READY_FOR_SPEC_APPROVAL"
+            spec_bytes = final["spec_markdown"].encode("utf-8")
+            committed = self.store.finish_operation(
+                operation_id=op_id, lease_token=br.lease_token,
+                expected_revision=br.revision_after_begin,
+                next_state=next_state,
+                staged_artifacts={"SPEC.md": spec_bytes},
+                result=final,
+            )
+            # state.spec_sha256 is filled by prepare_generation (finish); assert
+            # it equals the resolver hash (P0-3: read via resolver).
+            st = self._load_state()
+            assert st.spec_sha256 == self._resolver(st).hash_of("SPEC.md")
+            return {
+                "status": final_status,
+                "questions": questions,
+                "spec_sha256": st.spec_sha256,
+                "state": committed["state"],
+                "revision": committed["revision"],
+                "operation_id": op_id,
+            }
+        except BaseException:
+            # P0-2 abnormal path: route to NEEDS_HUMAN, never strand mid-external.
+            self.store.fail_operation(
+                operation_id=op_id, lease_token=br.lease_token,
+                reason="planner_draft_spec adapter/validate failure",
+            )
+            raise
+
+    # ------------------------------------------------------------------
+    # config-derived adapter timeout
+    # ------------------------------------------------------------------
+
+    def _adapter_timeout(self, section: str) -> int:
+        """Return the timeout (seconds) for an adapter section
+        (``planner`` / ``reviewer``). Defaults to 120 if unset."""
+        node = self.config.get(section, {}) if self.config else {}
+        return int(node.get("timeout_sec", 120))
 
     # ------------------------------------------------------------------
     # Hard checks — shared by check_stop and workflow_complete_task
