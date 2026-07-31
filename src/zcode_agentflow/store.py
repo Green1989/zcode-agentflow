@@ -961,13 +961,21 @@ class Store:
 
     def _verify_generation_blobs(self, state: State) -> None:
         """Integrity-check the generation ``state.artifact_generation`` points
-        at (Spec §4.7, P0-3). Recompute each blob's sha against the manifest and
-        raise :class:`artifacts.ArtifactCorrupt` on any mismatch. A state with
-        no current generation (no artifacts committed yet) passes trivially.
+        at (Spec §4.7, P0-3; Plan Task 3.5/3.8: recovery verifies each blob's
+        sha and FAILS — never returns successfully against an incomplete/
+        corrupt generation). Fail CLOSED on:
 
-        This closes the gap that the promotion test only verified
-        freshly-written normal blobs: recovery now detects a blob that was
-        tampered after it was committed.
+          - the generation manifest is missing (the committed generation is
+            incomplete — the state dangles at a generation that no longer
+            exists);
+          - any referenced blob is missing (incomplete generation);
+          - any blob's recomputed sha != the manifest's recorded sha
+            (tampering / corruption / disk rot).
+
+        A state with NO current generation (no artifacts committed yet) passes
+        trivially. Raises :class:`StateCorruptError` for the missing-manifest/
+        blob cases (the committed view is unreconstructable) and
+        :class:`artifacts.ArtifactCorrupt` for a sha mismatch.
         """
         from zcode_agentflow import artifacts as _artifacts
 
@@ -977,14 +985,19 @@ class Store:
         try:
             gen = _artifacts.load_generation(self.control_root, gen_id)
         except FileNotFoundError:
-            return  # state points at a generation whose manifest is gone; the
-            # caller's later ArtifactResolver read will raise ArtifactNotFound —
-            # not an integrity failure to fabricate here.
+            raise StateCorruptError(
+                f"state points at generation {gen_id!r} whose manifest is "
+                f"missing — the committed generation is incomplete; cannot "
+                f"recover a consistent state"
+            )
         for name, ref in gen.index.items():
             bpath = self.control_root / ref["blob"]
             if not bpath.exists():
-                # missing blob is a different failure; let read() surface it.
-                continue
+                raise StateCorruptError(
+                    f"artifact {name!r} blob {ref['blob']!r} of generation "
+                    f"{gen_id!r} is missing — the committed generation is "
+                    f"incomplete; cannot recover a consistent state"
+                )
             actual = canonical.sha256_hex(bpath.read_bytes())
             if actual != ref["sha256"]:
                 raise _artifacts.ArtifactCorrupt(

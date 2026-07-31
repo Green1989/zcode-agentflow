@@ -130,6 +130,63 @@ def test_recover_refuses_tampered_blob_in_pointed_generation(tmp_path: Path):
         artifacts.ArtifactResolver(control, recovered).read("SPEC.md")
 
 
+def test_recover_itself_fails_closed_on_tampered_blob(tmp_path: Path):
+    """Plan Task 3.5/3.8: recovery VERIFIES each blob's sha and FAILS — recover()
+    itself must raise, not return a state whose later read raises. A tampered
+    blob in the pointed generation must surface from recover() directly.
+    """
+    import shutil
+
+    control = tmp_path / "control"
+    control.mkdir()
+    st = _commit_spec(control, body=b"# Spec\n")
+
+    gen = artifacts.load_generation(control, st.artifact_generation)
+    (control / gen.index["SPEC.md"]["blob"]).write_bytes(b"# TAMPERED\n")
+
+    fresh = store.Store(control)
+    # recover() must raise (fail closed) — not return successfully.
+    with pytest.raises((store.StateCorruptError, artifacts.ArtifactCorrupt)):
+        fresh.recover()
+
+
+def test_recover_fails_closed_on_missing_manifest(tmp_path: Path):
+    """Plan Task 3.8 recover pseudocode: corrupt/missing state must not silently
+    succeed. If state.json points at a generation whose manifest is GONE, the
+    committed generation is incomplete — recover() must fail closed, not return a
+    state dangling at a missing generation (fail-open bug P0-1).
+    """
+    import shutil
+
+    control = tmp_path / "control"
+    control.mkdir()
+    st = _commit_spec(control, body=b"# Spec\n")
+
+    # delete the generation manifest the state points at
+    shutil.rmtree(control / "artifacts" / st.artifact_generation)
+
+    fresh = store.Store(control)
+    with pytest.raises(Exception):
+        fresh.recover()
+
+
+def test_recover_fails_closed_on_missing_blob(tmp_path: Path):
+    """If a generation's manifest is present but a referenced blob is MISSING,
+    the committed generation is incomplete — recover() must fail closed, not
+    return successfully (fail-open bug P0-1).
+    """
+    control = tmp_path / "control"
+    control.mkdir()
+    st = _commit_spec(control, body=b"# Spec\n")
+
+    gen = artifacts.load_generation(control, st.artifact_generation)
+    (control / gen.index["SPEC.md"]["blob"]).unlink()  # manifest stays, blob gone
+
+    fresh = store.Store(control)
+    with pytest.raises(Exception):
+        fresh.recover()
+
+
 # --------------------------------------------------------------------------- #
 # (c) review_bundle must NOT swallow corruption as a generic Exception
 # --------------------------------------------------------------------------- #
