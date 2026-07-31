@@ -44,3 +44,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+# Layer 3 (tests/smoke) uses the REAL Codex/Grok CLIs and is OFF by default —
+# it is never collected by the default suite. Run it manually with
+# AGENTFLOW_SMOKE=1 python tests/smoke/run_local_smoke.py (Task 8.3 / §21).
+addopts = ["--ignore=tests/smoke"]
