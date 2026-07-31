@@ -589,7 +589,8 @@ class Store:
     # ---- FINISH (short lock; SOLE committer of state.json, errata #6) ----
 
     def finish_operation(self, *, operation_id, lease_token, expected_revision,
-                         next_state, staged_artifacts, result) -> dict:
+                         next_state, staged_artifacts, result,
+                         base_commit=None) -> dict:
         """Re-take the per-Run lock, verify op + lease + revision_after_begin,
         write the result + the next state_after snapshot, append+fsync the
         finish event, and THEN perform the SINGLE ``os.replace(state.json)``
@@ -628,6 +629,12 @@ class Store:
             state.revision = state.revision + 1
             state.active_operation_id = None
             state.active_operation_lease = None
+            # Fold authoritative fields the caller wants atomically committed
+            # into the SAME state (P0-2): e.g. workflow_init's base_commit must
+            # land in the single os.replace below, NOT a separate post-finish
+            # save that a crash could skip. Only set when provided.
+            if base_commit is not None:
+                state.base_commit = base_commit
 
             # persist the adapter result (if any) + the new state_after snapshot.
             if result is not None:
@@ -932,6 +939,8 @@ class Store:
             state.artifact_generation = rolled.artifact_generation
             state.execution_result_sha256 = rolled.execution_result_sha256
             state.review_result_sha256 = rolled.review_result_sha256
+            # authoritative fields the finish folded into its commit (P0-2):
+            state.base_commit = rolled.base_commit
             op.mark_committed()
 
     def _load_or_rebuild_state(self) -> State:
@@ -1088,11 +1097,8 @@ def init_run(*, user_data_root, target_repo, control_root, worktree_root,
                 next_state="INITIALIZING_WORKTREE",
                 staged_artifacts={},
                 result={"worktree": str(worktree_root)},
+                base_commit=base_commit,
             )
-            # record base_commit on the committed state
-            committed = State.load(control_root)
-            committed.base_commit = base_commit
-            committed.save(control_root)
         except CrashInjected:
             raise
         except BaseException:
