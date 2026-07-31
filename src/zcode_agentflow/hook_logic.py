@@ -49,7 +49,6 @@ __all__ = [
     "EXIT_ALLOW",
     "EXIT_DENY",
     "EXIT_ERROR",
-    "STOP_REENTRY_CAP",
     "EDIT_TOOLS",
     "PROTECTED_SUBPATHS",
     "run_protect_artifacts",
@@ -67,8 +66,9 @@ EXIT_ALLOW = 0
 EXIT_DENY = 2
 EXIT_ERROR = 1
 
-# spike stop_reentry_limit: Stop may request continuation up to 3 times.
-STOP_REENTRY_CAP = 3
+# spike stop_reentry_limit: Stop may request continuation up to 3 times — but the
+# cap is enforced HOST-SIDE via the stopHookActive field. The hook no longer keeps
+# its own counter (P0-4 audit-fix, Plan erratum 11); see _host_is_capping.
 
 # File-mutating tool names the guard applies to (spike tool_aliases: Write/Edit
 # arrive as ApplyPatch; MultiEdit is the batch edit). Read/Glob/Grep are NOT
@@ -321,63 +321,35 @@ def _build_engine():
         return None
 
 
-def _stop_counter_path(payload: dict) -> Path | None:
-    """Location of the per-(session,turn) Stop continuation counter file.
+def _host_is_capping(payload: dict) -> bool:
+    """Whether the host has signalled it is on its last allowed continuation.
 
-    The host does not hand the hook a re-entry count (the spike's
-    stop_reentry_limit is enforced host-side via ``stopHookActive``). To still
-    escalate to NEEDS_HUMAN instead of looping, the hook keeps a tiny side
-    counter under the control root, keyed by ``(sessionId, turnId)``. Returns
-    None when no control root can be located — then the cap cannot be enforced
-    and the hook simply requests continuation each time (the host's own cap
-    remains the backstop)."""
-    cr = _resolve_control_root()
-    if cr is None:
-        return None
-    session = _get_dual(payload, "session_id", "sessionId", "") or "unknown"
-    turn = _get_dual(payload, "turn_id", "turnId", "") or _get_dual(
-        payload, "turnId", "turn_id", "") or "t0"
-    # filesystem-safe key (ids are already restricted, but be defensive)
-    safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in f"{session}__{turn}")
-    return Path(cr) / "operations" / f".stop_counter__{safe}.json"
+    The spike-confirmed 3-continuation cap (stop_reentry_limit) is enforced
+    HOST-SIDE via the ``stopHookActive`` field (docs/capabilities.json). The host
+    sets it true once it has already granted the maximum number of continuations
+    and is about to stop regardless. When true, the hook escalates to
+    NEEDS_HUMAN instead of requesting another continuation it will not get.
 
-
-def _continuation_count(payload: dict) -> int:
-    """Read how many continuations THIS (session,turn) has already consumed.
-
-    Returns 0 when no counter exists yet (first Stop of the turn) or when no
-    control root is locatable. The counter is bumped by
-    :func:`_bump_continuation` only after a continuation is actually requested,
-    so the count reflects prior denials, not this call."""
-    p = _stop_counter_path(payload)
-    if p is None or not p.exists():
-        return 0
-    try:
-        return int(json.loads(p.read_text(encoding="utf-8")).get("count", 0))
-    except (OSError, ValueError, TypeError):
-        return 0
-
-
-def _bump_continuation(payload: dict) -> None:
-    """Increment the per-(session,turn) continuation counter (best-effort)."""
-    p = _stop_counter_path(payload)
-    if p is None:
-        return
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        count = _continuation_count(payload) + 1
-        p.write_text(json.dumps({"count": count}), encoding="utf-8")
-    except OSError:
-        _log.warning("stop counter could not be persisted; host cap remains")
+    (P0-4 audit-fix: the old hook-side counter under ``<control_root>/operations/``
+    is removed — it violated the 'Store is the sole writer of operations/'
+    invariant. The host already owns this cap; the hook no longer duplicates it.)"""
+    return bool(_get_dual(payload, "stop_hook_active", "stopHookActive", False))
 
 
 def run_gate_on_stop_with_feedback(payload: dict) -> tuple[int, dict | None]:
     """Run the Stop gate and return ``(exit_code, feedback_json_or_None)``.
 
     Delegates to ``engine.check_stop`` (read-only, the single source) and acts
-    on ``{allow_stop, reasons}``. When the run is not clear to stop, it requests
-    continuation up to :data:`STOP_REENTRY_CAP` times; past the cap it escalates
-    to NEEDS_HUMAN feedback instead of looping (stop_reentry_limit)."""
+    on ``{allow_stop, reasons}``. When the run is not clear to stop:
+
+      * if the host has NOT started capping (``stopHookActive`` false) -> request
+        a continuation (the agent learns why it must not stop and gets another
+        turn);
+      * if the host signals it is on its last allowed continuation
+        (``stopHookActive`` true) -> escalate to NEEDS_HUMAN feedback instead of
+        looping (the cap is the host's; the hook never writes a counter).
+
+    The hook writes NO files anywhere (Plan erratum 11)."""
     eng = _build_engine()
     if eng is None:
         # no active run / no context: nothing to gate, allow the stop.
@@ -391,16 +363,8 @@ def run_gate_on_stop_with_feedback(payload: dict) -> tuple[int, dict | None]:
     if decision.get("allow_stop"):
         return EXIT_ALLOW, None
     reasons = list(decision.get("reasons") or [])
-    # how many continuations have already been requested for this turn?
-    continuations = _continuation_count(payload)
-    over_cap = continuations >= STOP_REENTRY_CAP
-    if over_cap:
-        # past the spike-confirmed cap: stop looping, escalate to a human.
-        feedback = build_stop_feedback(payload, reasons=reasons, needs_human=True)
-    else:
-        # under the cap: request continuation and record it.
-        _bump_continuation(payload)
-        feedback = build_stop_feedback(payload, reasons=reasons, needs_human=False)
+    needs_human = _host_is_capping(payload)
+    feedback = build_stop_feedback(payload, reasons=reasons, needs_human=needs_human)
     return EXIT_DENY, feedback
 
 

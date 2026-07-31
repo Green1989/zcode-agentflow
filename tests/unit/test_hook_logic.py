@@ -356,14 +356,44 @@ class TestGateOnStop:
         assert eng.check_stop_calls == [None]
 
     def test_respects_stop_reentry_limit(self, monkeypatch, tmp_path):
-        """Past the spike-confirmed cap (3 continuations) the hook stops looping
-        and escalates to NEEDS_HUMAN feedback (stop_reentry_limit).
+        """The host enforces the spike-confirmed 3-continuation cap via the
+        ``stopHookActive`` field (docs/capabilities.json stop_reentry_limit). The
+        hook does NOT keep its own counter — when ``stopHookActive`` is FALSE it
+        requests continuation; when the host signals TRUE (it is on its last
+        allowed continuation) the hook escalates to NEEDS_HUMAN instead of
+        requesting yet another continuation.
 
-        The re-entry count is tracked by a per-(session,turn) side counter under
-        the control root (the host enforces its own cap too, but does not hand
-        the hook a count), so a real control root is wired up here."""
+        (P0-4 audit-fix: the old hook-side counter under ``<control_root>/
+        operations/`` is GONE — it violated the 'Store is the sole writer of
+        operations/' invariant. See test_stop_writes_nothing_under_operations.)"""
+        eng = _FakeEngine({"allow_stop": False, "reasons": ["blocked"], "checks": []})
+        monkeypatch.setattr(hook_logic, "_build_engine", lambda: eng)
+
+        # host has NOT started capping yet: request continuation
+        rc, feedback = hook_logic.run_gate_on_stop_with_feedback(
+            _stop_payload({"stopHookActive": False})
+        )
+        assert rc == hook_logic.EXIT_DENY
+        assert feedback is not None
+        assert "NEEDS_HUMAN" not in feedback["additionalContext"]
+
+        # host signals it is on the last allowed continuation (stopHookActive=true):
+        # stop looping, escalate to NEEDS_HUMAN.
+        rc, feedback = hook_logic.run_gate_on_stop_with_feedback(
+            _stop_payload({"stopHookActive": True})
+        )
+        assert rc == hook_logic.EXIT_DENY
+        assert feedback is not None
+        assert "NEEDS_HUMAN" in feedback["additionalContext"]
+
+    def test_stop_writes_nothing_under_operations(self, monkeypatch, tmp_path):
+        """P0-4 invariant: the Stop hook must NOT write anything under
+        ``<control_root>/operations/`` — that tree is written ONLY by the Store
+        (Plan line 164/1757). The old hook-side counter (``.stop_counter__*``)
+        violated this with a non-atomic, unlocked ``write_text``."""
         control_root = tmp_path / "control"
-        (control_root / "operations").mkdir(parents=True)
+        ops = control_root / "operations"
+        ops.mkdir(parents=True)
         monkeypatch.setenv("ZCODE_PROJECT_DIR", str(tmp_path))
         (tmp_path / "active-run.json").write_text(
             __import__("json").dumps({"control_root": str(control_root)}),
@@ -371,19 +401,18 @@ class TestGateOnStop:
         )
         eng = _FakeEngine({"allow_stop": False, "reasons": ["blocked"], "checks": []})
         monkeypatch.setattr(hook_logic, "_build_engine", lambda: eng)
-        # under the cap: continuation requested each time (and counted)
-        for n in range(0, 3):
-            rc, _ = hook_logic.run_gate_on_stop_with_feedback(
-                _stop_payload({"stopHookActive": True, "toolCallCount": n})
+        # drive the hook several times — with and without stopHookActive — so any
+        # counter/bump code path would have had a chance to write.
+        for sha in (False, True, False, True):
+            hook_logic.run_gate_on_stop_with_feedback(
+                _stop_payload({"stopHookActive": sha})
             )
-            assert rc == hook_logic.EXIT_DENY
-        # at/over the cap: escalate to NEEDS_HUMAN instead of another loop
-        rc, feedback = hook_logic.run_gate_on_stop_with_feedback(
-            _stop_payload({"stopHookActive": True, "toolCallCount": 3})
+        # the operations/ tree must be EMPTY (nothing the hook created). Any entry
+        # here is a Store-owned-files violation.
+        leftover = [p.name for p in ops.iterdir()]
+        assert leftover == [], (
+            f"Stop hook wrote under operations/ (Store-owned): {leftover}"
         )
-        assert rc == hook_logic.EXIT_DENY
-        assert feedback is not None
-        assert "NEEDS_HUMAN" in feedback["additionalContext"]
 
     def test_no_active_run_allows_stop(self, monkeypatch):
         """If there is no active run (no Engine), the Stop hook has nothing to
