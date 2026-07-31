@@ -1,0 +1,11 @@
+{
+  "_doc": "AgentFlow protect-artifacts PreToolUse hook (Task 7.1). This file is the canonical record of the hook entry; it is consumed by the plugin manifest (Task 7.2 .zcode-plugin/plugin.json hooks component — capabilities.json zcode.manifest_fields.plugin_manifest.component_fields includes 'hooks'). Field provenance from docs/capabilities.json zcode.hooks: (1) 'event' = events_supported[PreToolUse]; (2) 'matcher' = matcher_is_regex (case-sensitive, matches tool names; tool_aliases Write/Edit->ApplyPatch); (3) the entry type 'process' is the discriminator implied by the separate process_hook_fields=[command,args,timeoutMs] vs command_hook_fields=[command,shell,timeout,timeoutMs] lists; (4) command/args/timeoutMs are the spike's process_hook_fields verbatim; (5) ${ZCODE_PLUGIN_ROOT} expansion = template_vars (plugin hooks only). The exact host-accepted GROUPING of event+matcher+entry is confirmed at Phase Exit by a real plugin load; the per-entry field names above are the spike's. The script (hooks/protect_artifacts.py) reads spike-shape dual-key stdin and answers via exit code 0/2 (exit_code_denies) + strict-JSON stdout hookSpecificOutput.permissionDecision (feedback_channel). Config-file hooks require hooks.enabled:true at the user scope. Threat model (Spec §1.2): process-integrity only, not same-privilege tamper-proof.",
+  "event": "PreToolUse",
+  "matcher": "Write|Edit|MultiEdit|ApplyPatch|NotebookEdit",
+  "type": "process",
+  "command": "python",
+  "args": [
+    "${ZCODE_PLUGIN_ROOT}/hooks/protect_artifacts.py"
+  ],
+  "timeoutMs": 10000
+}

@@ -1,0 +1,11 @@
+{
+  "_doc": "AgentFlow gate-on-stop Stop hook (Task 7.1). Canonical record of the hook entry; consumed by the plugin manifest (Task 7.2 .zcode-plugin/plugin.json hooks component). Field provenance from docs/capabilities.json zcode.hooks: (1) 'event' = events_supported[Stop]; (2) 'matcher' = '.*' (matcher_is_regex; Stop has no tool name to match, so match-all); (3) entry type 'process' is the discriminator implied by the separate process_hook_fields vs command_hook_fields lists; (4) command/args/timeoutMs = process_hook_fields verbatim; (5) ${ZCODE_PLUGIN_ROOT} = template_vars. Stop events carry stopHookActive/toolCallCount/responsePreview (events_observed_real.Stop.extra_fields). The exact host-accepted grouping is confirmed at Phase Exit by a real plugin load. The script (hooks/gate_on_stop.py) delegates to the SINGLE read-only engine.check_stop (Review §六.6 — never re-derives review/clean/HEAD) and answers via exit code 0/2 (exit_code_denies) + strict-JSON stdout additionalContext (feedback_channel). Past the stop_reentry_limit (3) it escalates to NEEDS_HUMAN feedback instead of looping. Threat model (Spec §1.2): process-integrity only.",
+  "event": "Stop",
+  "matcher": ".*",
+  "type": "process",
+  "command": "python",
+  "args": [
+    "${ZCODE_PLUGIN_ROOT}/hooks/gate_on_stop.py"
+  ],
+  "timeoutMs": 15000
+}
