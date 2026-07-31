@@ -42,9 +42,12 @@ from pathlib import Path
 
 from zcode_agentflow import (
     agents_context,
+    approval,
     artifacts,
+    canonical,
     gitops,
     ids,
+    manifest,
     prompts,
     schemas,
     store,
@@ -371,6 +374,218 @@ class Engine:
             self.store.fail_operation(
                 operation_id=op_id, lease_token=br.lease_token,
                 reason="planner_draft_spec adapter/validate failure",
+            )
+            raise
+
+    # ==================================================================
+    # Tool 3: workflow_approve_spec (HUMAN GATE 1; Spec §5.4; Task 5.1)
+    # ==================================================================
+
+    def workflow_approve_spec(self, *, expected_revision: int) -> dict:
+        """READY_FOR_SPEC_APPROVAL → PLANNING. HUMAN GATE 1: write a trusted
+        approval record (approval.record_approval), lock spec_sha256, advance to
+        PLANNING. The approval method is resolved from the effective_config
+        (strong zcode_tool_confirmation OR non_adversarial_convention fallback);
+        ``None`` (no strong + no fallback) raises ApprovalUnavailableError —
+        never silently degrades (Spec §5.4 / G6).
+        """
+        state = self._load_state()
+        op_id = self._op_id("workflow_approve_spec", expected_revision)
+        # resolve the approval method ONCE (the effective_config was fixed at
+        # startup by validate_capabilities; do not re-derive here).
+        mode = self.effective_config.get("effective_approval_mode")
+        # the canonical strong method; the fallback string maps to the constant.
+        if mode == "zcode_tool_confirmation" or mode == "prefer_zcode_tool_confirmation":
+            effective = approval.STRONG
+        elif mode == "non_adversarial_convention":
+            effective = approval.FALLBACK
+        else:
+            effective = None  # triggers ApprovalUnavailableError below
+
+        request = {
+            "tool": "workflow_approve_spec",
+            "args": {"expected_revision": expected_revision,
+                     "spec_sha256": state.spec_sha256},
+        }
+        br = self._begin(
+            tool="workflow_approve_spec", operation_id=op_id, request=request,
+            expected_revision=expected_revision,
+            intermediate_state="PLANNING", replay_policy="SAFE_READ",
+        )
+        try:
+            # record_approval writes the trusted record (raises if mode is None).
+            rec = approval.record_approval(
+                control_root=self.roots.control_root,
+                run_id=state.run_id, gate="SPEC",
+                artifact_sha256=state.spec_sha256,
+                commit_at_approval=state.base_commit or "",
+                effective_approval_mode=effective,
+            )
+            committed = self.store.finish_operation(
+                operation_id=op_id, lease_token=br.lease_token,
+                expected_revision=br.revision_after_begin,
+                next_state="PLANNING", staged_artifacts={}, result=rec,
+            )
+            return {
+                "state": committed["state"], "revision": committed["revision"],
+                "approval_method": rec["approval_method"],
+                "spec_sha256": state.spec_sha256,
+                "operation_id": op_id,
+            }
+        except BaseException:
+            self.store.fail_operation(
+                operation_id=op_id, lease_token=br.lease_token,
+                reason="workflow_approve_spec failure",
+            )
+            raise
+
+    # ==================================================================
+    # Tool 4: planner_create_plan (exactly-one-task via wrapper; P0-8, P0-5)
+    # ==================================================================
+
+    def planner_create_plan(self, *, approved_spec_sha256: str,
+                            expected_revision: int) -> dict:
+        """PLANNING → READY_FOR_EXECUTION. Codex read-only produces the single-
+        task plan; approved_spec_sha256 must match the locked spec. The RAW
+        plan-proposal wrapper is validated (P0-5): a multi-task goal fails
+        cleanly (BLOCKED/NEEDS_USER_INPUT or RAW-schema rejection) and is NEVER
+        silently reduced to tasks[0]. PLAN.md + task-manifest.json are promoted
+        as a new generation (inheriting SPEC); hashes from the resolver.
+        """
+        from zcode_agentflow.adapters.codex import CodexAdapter
+
+        state = self._load_state()
+        # validate the approved sha BEFORE beginning (do not spend an adapter call
+        # on a caller that does not know the locked spec).
+        if approved_spec_sha256 != state.spec_sha256:
+            raise WorkflowError(
+                f"approved_spec_sha256 {approved_spec_sha256!r} != locked "
+                f"spec_sha256 {state.spec_sha256!r}"
+            )
+        op_id = self._op_id("planner_create_plan", expected_revision)
+        agent_context = self._resolved_agent_context()
+        spec_markdown = self._resolver(state).read_text("SPEC.md")
+        prompt = prompts.render(
+            "planner-plan.md",
+            approved_spec_sha256=state.spec_sha256,
+            spec_markdown=spec_markdown,
+            agent_context=agent_context,
+        )
+        request = {
+            "kind": "create_plan",
+            "prompt": prompt,
+            "approved_spec_sha256": approved_spec_sha256,
+            "schema_path": str(schemas.SCHEMAS_DIR / "plan-proposal.schema.json"),
+        }
+        br = self._begin(
+            tool="planner_create_plan", operation_id=op_id, request=request,
+            expected_revision=expected_revision,
+            intermediate_state="PLANNING", replay_policy="COSTFUL_READ",
+        )
+        try:
+            codex = self.adapters.get("codex") or CodexAdapter()
+            result = codex.invoke(
+                request=request, repo_cwd=self.roots.run_worktree_root,
+                operation_dir=br.staging_dir,
+                timeout=self._adapter_timeout("planner"),
+            )
+            if result.exit_code != 0 or result.parsed is None:
+                raise WorkflowError(
+                    f"planner_create_plan adapter failed (exit={result.exit_code})"
+                )
+            wrapper = result.parsed
+            status = wrapper.get("status")
+            # P0-5: a non-READY wrapper routes to NEEDS_HUMAN (BLOCKED) or
+            # NEEDS_USER_INPUT — never silently takes a task.
+            if status == "BLOCKED":
+                self.store.finish_operation(
+                    operation_id=op_id, lease_token=br.lease_token,
+                    expected_revision=br.revision_after_begin,
+                    next_state="NEEDS_HUMAN", staged_artifacts={}, result=wrapper,
+                )
+                return {"status": "BLOCKED", "block_reason": wrapper.get("block_reason"),
+                        "operation_id": op_id}
+            if status == "NEEDS_USER_INPUT":
+                self.store.finish_operation(
+                    operation_id=op_id, lease_token=br.lease_token,
+                    expected_revision=br.revision_after_begin,
+                    next_state="NEEDS_USER_INPUT", staged_artifacts={}, result=wrapper,
+                )
+                return {"status": "NEEDS_USER_INPUT",
+                        "questions": wrapper.get("questions", []),
+                        "operation_id": op_id}
+            if status != "READY_FOR_EXECUTION":
+                raise WorkflowError(f"unexpected wrapper status {status!r}")
+
+            plan = wrapper["plan"]
+            # P0-5 (defense-in-depth at the engine, NOT just the adapter's RAW
+            # validation): a multi-task plan is NEVER silently reduced to
+            # tasks[0]. The wrapper's RAW schema already enforces maxItems:1, but
+            # an injected/test adapter could bypass it; the engine asserts here
+            # too so the invariant holds regardless of how the wrapper arrived.
+            if len(plan["tasks"]) != 1:
+                raise WorkflowError(
+                    f"v1 requires exactly one task; wrapper carried "
+                    f"{len(plan['tasks'])} (never silently take tasks[0])"
+                )
+            raw_task = plan["tasks"][0]
+            # assemble the FINAL plan envelope: inject run_id/base_commit/version.
+            final = {
+                "run_id": state.run_id,
+                "status": "READY_FOR_EXECUTION",
+                "plan_markdown": plan["plan_markdown"],
+                "plan_version": 1,
+                "base_commit": state.base_commit,
+                "tasks": [raw_task],
+            }
+            schemas.check_plan_context(
+                final, run_id=state.run_id, base_commit=state.base_commit,
+                program_allowlist=self.config.get("verification", {}).get("program_allowlist", []),
+                interpreter_allowlist=self.config.get("verification", {}).get("interpreter_allowlist", []),
+            )
+            (Path(br.staging_dir) / "out.json").write_text(
+                json.dumps(final, ensure_ascii=False), encoding="utf-8"
+            )
+
+            # build the self-reference-free task manifest (manifest.py). The
+            # manifest's plan_sha256 anchor = the canonical sha of PLAN.md (the
+            # same value state.plan_sha256 will hold after promotion), so the
+            # manifest binds to the plan bytes the run actually committed.
+            plan_md_bytes = canonical.canonical_text_bytes(
+                final["plan_markdown"].encode("utf-8")
+            )
+            plan_sha = canonical.sha256_hex(plan_md_bytes)
+            man = manifest.build_manifest(final, plan_sha256=plan_sha)
+            man_bytes = manifest.manifest_bytes(man)
+
+            staged = {
+                "PLAN.md": final["plan_markdown"].encode("utf-8"),
+                "task-manifest.json": man_bytes,
+            }
+            committed = self.store.finish_operation(
+                operation_id=op_id, lease_token=br.lease_token,
+                expected_revision=br.revision_after_begin,
+                next_state="READY_FOR_EXECUTION", staged_artifacts=staged,
+                result=final,
+            )
+            st = self._load_state()
+            # current_task = the single task id; plan/manifest shas from resolver.
+            st.current_task = raw_task["id"]
+            st.save(self.roots.control_root)
+            assert st.plan_sha256 == self._resolver(st).hash_of("PLAN.md")
+            assert st.task_manifest_sha256 == self._resolver(st).hash_of("task-manifest.json")
+            return {
+                "status": "READY_FOR_EXECUTION",
+                "state": committed["state"], "revision": committed["revision"],
+                "current_task": raw_task["id"],
+                "plan_sha256": st.plan_sha256,
+                "task_manifest_sha256": st.task_manifest_sha256,
+                "operation_id": op_id,
+            }
+        except BaseException:
+            self.store.fail_operation(
+                operation_id=op_id, lease_token=br.lease_token,
+                reason="planner_create_plan adapter/validate failure",
             )
             raise
 
