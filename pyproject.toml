@@ -36,7 +36,7 @@ test = [
 ]
 
 [project.scripts]
-zcode-agentflow = "zcode_agentflow.server:main"
+zcode-agentflow = "zcode_agentflow.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
