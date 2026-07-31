@@ -69,3 +69,10 @@ control_root/
 **/hooks.jsonl
 **/spike-*.jsonl
 **/bundle_checksums_*.txt
+
+# ---- ZCode tool runtime (NOT source) ----
+# .zcode/ is the ZCode IDE/tool runtime directory created in the repo root
+# (plan caches, session artifacts). It is generated tooling state, never source.
+# Scoped to the repo root (leading slash) so a same-named subdir under src/
+# (none currently) would not be affected.
+/.zcode/
