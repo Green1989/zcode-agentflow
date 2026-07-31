@@ -133,12 +133,10 @@ CONFIG_SCHEMA = {
                 "command_policy": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["shell", "program_allowlist_from_agents_md",
-                                 "cwd_must_be_within", "network_policy",
+                    "required": ["shell", "cwd_must_be_within", "network_policy",
                                  "secret_redaction"],
                     "properties": {
                         "shell": {"type": "boolean"},
-                        "program_allowlist_from_agents_md": {"type": "boolean"},
                         "cwd_must_be_within": {"type": "string"},
                         # honest advisory marker — NOT an enforced `network: deny`
                         "network_policy": {"type": "string",

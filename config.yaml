@@ -54,7 +54,6 @@ reviewer:
 verification:                   # layer 1: verification command policy
   command_policy:
     shell: false
-    program_allowlist_from_agents_md: true
     cwd_must_be_within: run_worktree_root
     network_policy: advisory_only   # honest: v1 advisory only, NOT an enforced deny
     secret_redaction: true

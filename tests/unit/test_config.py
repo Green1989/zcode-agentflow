@@ -120,6 +120,35 @@ def test_verification_allowlists_present_and_typed():
     assert "cmd.exe" in v["interpreter_allowlist"]
 
 
+def test_no_stale_agents_md_allowlist_field():
+    """Review P1-5: ``program_allowlist_from_agents_md`` was a dead, misleading
+    config knob — required by the schema and set to ``true`` in production, but
+    never read by any code (the real allowlists are the structured
+    program_allowlist/interpreter_allowlist arrays). Its name implies "derive the
+    allowlist from AGENTS.md", which directly contradicts the Plan/Spec stance
+    that AGENTS.md is context-only and NEVER a security source.
+
+    The field must NOT be present in the production config NOR required by the
+    schema. (A config that still sets it is rejected via additionalProperties:
+    False, so an operator cannot silently re-enable a misleading knob.)
+    """
+    cfg = config_mod.load(PROD_CONFIG)
+    cp = cfg["verification"]["command_policy"]
+    assert "program_allowlist_from_agents_md" not in cp, (
+        "production config still carries the dead `program_allowlist_from_agents_md` "
+        "knob whose name implies AGENTS.md is an allowlist source (it is not)"
+    )
+    # the schema must not require it: a command_policy WITHOUT the field validates
+    schema = config_mod.CONFIG_SCHEMA
+    vprops = schema["properties"]["verification"]["properties"]["command_policy"]
+    assert "program_allowlist_from_agents_md" not in vprops["required"], (
+        "schema still lists program_allowlist_from_agents_md as required"
+    )
+    assert "program_allowlist_from_agents_md" not in vprops["properties"], (
+        "schema still declares program_allowlist_from_agents_md as a property"
+    )
+
+
 def test_verification_allowlists_optional(tmp_path):
     """The allowlists are OPTIONAL: a config without them still validates (the
     engine supplies runtime allowlists when invoking run_verification)."""
