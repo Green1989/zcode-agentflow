@@ -83,6 +83,9 @@ def _emit_plan_proposal() -> dict:
                 }
             ],
         },
+        # R2-1: strict-mode envelope — all keys always present (plan non-null for READY).
+        "questions": [],
+        "block_reason": "",
     }
 
 

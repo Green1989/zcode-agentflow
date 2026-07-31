@@ -29,7 +29,7 @@
     "hooks/gate-on-stop.json"
   ],
   "toolConfirmation": {
-    "_doc": "P1-1 honesty record. docs/capabilities.json proves ZCode SUPPORTS tool-level confirmation but it is NOT CONFIGURED in this env (defaultMode=yolo). A per-tool confirmation field does NOT exist in the plugin schema; this block records the confirmed state and surfaces the canonical security_warning so the reduced assurance is never hidden (Spec §5.4/G6). The non-adversarial convention flow (the actual fallback) is enforced by the Skill guidance, not by a manifest field. RUNTIME GATE: with the shipped config.yaml (human_gates.spec_approval.allow_non_adversarial_fallback=false) the server refuses to START (validate_capabilities raises CapabilityError, G6) rather than silently degrade; to actually run, the operator must either (a) set allow_non_adversarial_fallback=true to accept the reduced-assurance fallback, or (b) configure ~/.claude/settings.json so tool_confirmation is truly in effect.",
+    "_doc": "P1-1 honesty record. docs/capabilities.json proves ZCode SUPPORTS tool-level confirmation but it is NOT CONFIGURED in this env (defaultMode=yolo). A per-tool confirmation field does NOT exist in the plugin schema; this block records the confirmed state and surfaces the canonical security_warning so the reduced assurance is never hidden (Spec §5.4/G6). The non-adversarial convention flow (the actual fallback) is enforced by the Skill guidance, not by a manifest field. RUNTIME GATE (R2-3/P0-3): the SHIPPED config.yaml has allow_non_adversarial_fallback=true (capabilities.json tool_confirmation is value:false in this env), so the server STARTS in the non_adversarial_convention fallback WITH this security_warning surfaced (never hidden). An operator who has configured ~/.claude/settings.json to actually prompt on workflow_approve_spec may set the flag false to force fail-loud until strong confirmation is in effect (G6).",
     "supported": false,
     "configured": false,
     "fallback": "non_adversarial_convention",
@@ -37,9 +37,9 @@
     "config_location": "~/.claude/settings.json (permissions.defaultMode + allow/deny rules) — NOT a plugin manifest field",
     "strong_when": "supported=true AND configured=true (permissions ask/confirm on mcp__zcode-agentflow__workflow_approve_spec)",
     "runtime_gate": {
-      "allow_non_adversarial_fallback_in_config_yaml": false,
-      "startup_behavior": "validate_capabilities RAISES CapabilityError (G6: fail loud, never silently degrade) — server does not start until the operator resolves this",
-      "resolve": "set human_gates.spec_approval.allow_non_adversarial_fallback=true (accept reduced assurance) OR configure ~/.claude/settings.json so tool_confirmation is in effect"
+      "shipped_allow_non_adversarial_fallback": true,
+      "startup_behavior": "shipped config starts the server in the non_adversarial_convention fallback (tool_confirmation is supported but NOT configured in this env); the security_warning below is surfaced so the reduced assurance is never hidden",
+      "force_strict": "set allow_non_adversarial_fallback=false to make validate_capabilities RAISE CapabilityError at startup (G6 fail-loud) until tool_confirmation is truly configured in ~/.claude/settings.json"
     },
     "security_warning": "Security assurance is REDUCED: ZCode tool-level mandatory confirmation is not in effect for workflow_approve_spec. The approval used the non-adversarial convention flow, which relies on the model following guidance and does NOT defend against a malicious or coerced model. Verify this approval genuinely came from a human before proceeding."
   }

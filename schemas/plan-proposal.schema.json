@@ -2,17 +2,18 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "plan-proposal.schema.json",
   "title": "plan-proposal (RAW planner-result wrapper, model-emitted)",
-  "description": "The planner-result wrapper (P0-5): lets a multi-task goal fail cleanly at validation. What Codex emits from planner_create_plan. RAW: FORBIDS authoritative fields (run_id, base_commit, plan_version, hashes). status is READY_FOR_EXECUTION (clean plan) | NEEDS_USER_INPUT (open questions) | BLOCKED. The plan (when present) is a strict SINGLE-task plan WITHOUT base_commit/run_id — the engine injects those into the FINAL plan-envelope. (Task 2.1, P0-5, parallel P0-4.)",
+  "description": "The planner-result wrapper (P0-5): lets a multi-task goal fail cleanly at validation. What Codex emits from planner_create_plan. RAW: FORBIDS authoritative fields (run_id, base_commit, plan_version, hashes). status is READY_FOR_EXECUTION (clean plan) | NEEDS_USER_INPUT (open questions) | BLOCKED. The plan (when status=READY_FOR_EXECUTION) is a strict SINGLE-task plan WITHOUT base_commit/run_id — the engine injects those into the FINAL plan-envelope. (Task 2.1, P0-5, parallel P0-4.) STRICT-MODE (AF-7/R2-1): codex response_format uses strict-mode structured outputs, which require every object's `required` to list ALL its properties (no optional fields) + additionalProperties:false. The wrapper is therefore a fixed-key envelope: status/plan/questions/block_reason are ALL always present; plan is null unless status=READY_FOR_EXECUTION; questions is [] unless status=NEEDS_USER_INPUT; block_reason is \"\" unless status=BLOCKED. The engine's wrapper-status cross-field rules (schemas.validate_raw_plan) enforce the per-status semantics on top of this structural envelope.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["status"],
+  "required": ["status", "plan", "questions", "block_reason"],
   "properties": {
     "status": {
       "type": "string",
       "enum": ["READY_FOR_EXECUTION", "NEEDS_USER_INPUT", "BLOCKED"]
     },
     "plan": {
-      "type": "object",
+      "description": "The single-task plan. REQUIRED to be present (strict-mode), but null unless status=READY_FOR_EXECUTION (the wrapper-status rules enforce non-null plan only for READY_FOR_EXECUTION). type:[object,null] keeps it structurally valid in all three status branches.",
+      "type": ["object", "null"],
       "additionalProperties": false,
       "required": ["plan_markdown", "tasks"],
       "properties": {
@@ -26,10 +27,14 @@
       }
     },
     "questions": {
+      "description": "Open questions; [] unless status=NEEDS_USER_INPUT (wrapper-status rules enforce non-empty for NEEDS_USER_INPUT).",
       "type": "array",
       "items": { "type": "string", "minLength": 1 }
     },
-    "block_reason": { "type": "string", "minLength": 1 }
+    "block_reason": {
+      "description": "Why the goal is BLOCKED; \"\" unless status=BLOCKED (wrapper-status rules enforce non-empty for BLOCKED).",
+      "type": "string"
+    }
   },
   "definitions": {
     "taskId": {

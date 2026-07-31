@@ -217,10 +217,15 @@ def process_config() -> RunContext:
         repo). The directory is created if missing (it is the run-data HOME, not
         per-run durable state — out of Store scope; Appendix A marks bootstrap
         "Mutates durable state? no").
-      * ``config``       — ``AGENTFLOW_CONFIG`` loaded via :func:`config.load`
-        (strict schema: unknown keys / wrong types rejected).
-      * ``effective_config`` — ``AGENTFLOW_CAPABILITIES`` (gates) run through
-        :func:`config.validate_capabilities`.
+      * ``config``       — ``AGENTFLOW_CONFIG`` if set, else
+        ``<plugin_root>/config.yaml`` (config ships WITH the plugin, Spec §6).
+        Loaded via :func:`config.load` (strict schema: unknown keys / wrong types
+        rejected). Defaulting to plugin_root (not the process cwd) is what lets
+        the HOOKS resolve context: they inherit ``ZCODE_PLUGIN_ROOT`` but not
+        ``AGENTFLOW_CONFIG``, and their cwd is the target project (R2-2/P0-1).
+      * ``effective_config`` — ``AGENTFLOW_CAPABILITIES`` if set, else
+        ``<plugin_root>/docs/capabilities.json`` (capabilities ship WITH the
+        plugin); the gates are run through :func:`config.validate_capabilities`.
 
     The capability gate is G6 fail-loud: if ``tool_confirmation=false`` and the
     config does not allow the non-adversarial fallback, ``validate_capabilities``
@@ -246,8 +251,18 @@ def process_config() -> RunContext:
         user_data_root = plugin_root.resolve().parent / DEFAULT_USER_DATA_DIRNAME
     user_data_root.mkdir(parents=True, exist_ok=True)
 
-    cfg_path = os.environ.get(ENV_CONFIG_PATH, "config.yaml")
-    cap_path = os.environ.get(ENV_CAPABILITIES_PATH)
+    # config.yaml + docs/capabilities.json ship WITH the plugin (Spec §6). They
+    # are therefore resolved relative to plugin_root when the env vars are absent
+    # — NOT relative to the process cwd. This matters for HOOKS: the host
+    # launches hook scripts with ZCODE_PLUGIN_ROOT set (capabilities.json
+    # template_vars) but NOT AGENTFLOW_CONFIG/_CAPABILITIES (the hook .json files
+    # have no env block), and the hook's cwd is the TARGET PROJECT, so a
+    # cwd-relative lookup would miss and the hook would fail-open (R2-2/P0-1).
+    # An explicit env var always wins (tests / non-standard layouts).
+    cfg_path = os.environ.get(ENV_CONFIG_PATH) or str(plugin_root / "config.yaml")
+    cap_path = os.environ.get(ENV_CAPABILITIES_PATH) or str(
+        plugin_root / "docs" / "capabilities.json"
+    )
     try:
         cfg = config_mod.load(cfg_path)
     except FileNotFoundError as exc:
@@ -261,24 +276,18 @@ def process_config() -> RunContext:
             f"validation: {exc}"
         ) from exc
 
-    findings = None
-    if cap_path:
-        try:
-            findings = json.loads(Path(cap_path).read_text(encoding="utf-8"))["gates"]
-        except (FileNotFoundError, KeyError, ValueError) as exc:
-            raise ContextResolutionError(
-                f"cannot resolve production run context: AGENTFLOW_CAPABILITIES "
-                f"could not be read from {cap_path!r}: {exc}"
-            ) from exc
+    # capabilities always resolve (explicit env, else <plugin_root>/docs/
+    # capabilities.json — they ship with the plugin). A read/parse failure is a
+    # hard error (fail-loud), not a silent degrade to absent-gate defaults.
+    try:
+        findings = json.loads(Path(cap_path).read_text(encoding="utf-8"))["gates"]
+    except (FileNotFoundError, KeyError, ValueError) as exc:
+        raise ContextResolutionError(
+            f"cannot resolve production run context: capabilities could not be "
+            f"read from {cap_path!r}: {exc}"
+        ) from exc
 
-    if findings is not None:
-        effective = config_mod.validate_capabilities(cfg, findings)
-    else:
-        # No capabilities file provided: use validate_capabilities' absent-gate
-        # defaults (effective_approval_mode=prefer_zcode_tool_confirmation,
-        # effective_reasoning_effort=high). The startup gate in server.py still
-        # runs separately when AGENTFLOW_CAPABILITIES is set.
-        effective = config_mod.validate_capabilities(cfg, {})
+    effective = config_mod.validate_capabilities(cfg, findings)
 
     return RunContext(
         plugin_root=plugin_root,

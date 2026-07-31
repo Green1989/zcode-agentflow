@@ -28,7 +28,16 @@ human_gates:
   spec_approval:
     required: true
     method: prefer_zcode_tool_confirmation        # §5.4 two-layer scheme
-    allow_non_adversarial_fallback: false         # false=fail at startup if unsupported; true=degrade with a warning
+    # R2-3 (P0-3): shipped true. capabilities.json gates.tool_confirmation is
+    # value:false in this env (defaultMode=yolo; supported but NOT configured).
+    # true = accept the non_adversarial_convention fallback so the server STARTS
+    # and Phase 7 'real plugin load / tools/list' is satisfiable; the fallback
+    # runs WITH the canonical security_warning surfaced (approval.py / plugin.json
+    # toolConfirmation.security_warning), never hidden. An operator who has
+    # configured ~/.claude/settings.json to actually prompt on
+    # workflow_approve_spec may set this false to force fail-loud until strong
+    # confirmation is in effect (G6).
+    allow_non_adversarial_fallback: true
   final_merge:
     required: true
     v1_terminal_state: READY_TO_MERGE             # v1 does NOT perform the merge action

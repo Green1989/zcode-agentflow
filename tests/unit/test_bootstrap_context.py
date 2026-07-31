@@ -183,6 +183,43 @@ def test_process_config_accepts_claude_plugin_root_fallback(tmp_path, monkeypatc
     assert ctx.plugin_root == plugin.resolve()
 
 
+def test_process_config_defaults_config_and_caps_to_plugin_root(tmp_path, monkeypatch):
+    """R2-2 (P0-1) — the REAL hook environment inherits ``ZCODE_PLUGIN_ROOT`` but
+    NOT ``AGENTFLOW_CONFIG`` / ``AGENTFLOW_CAPABILITIES`` (the hook .json files
+    have no env block; only mcpServers.env sets those). The hook's cwd is the
+    TARGET PROJECT, so a cwd-relative ``config.yaml`` lookup would miss and the
+    hook would fail-open.
+
+    config.yaml + docs/capabilities.json ship WITH the plugin (Spec §6), so when
+    the env vars are absent process_config() must fall back to
+    ``<plugin_root>/config.yaml`` and ``<plugin_root>/docs/capabilities.json``.
+    This is the production hook resolution path."""
+    # simulate an INSTALLED plugin dir: it contains config.yaml + docs/capabilities.json
+    plugin = tmp_path / "plugin"
+    plugin.mkdir()
+    # the plugin ships a fallback-allowed config (mirrors R2-3 shipped config)
+    _write_fallback_config(plugin / "config.yaml")
+    (plugin / "docs").mkdir()
+    (plugin / "docs" / "capabilities.json").write_bytes(
+        (REPO_ROOT / "docs" / "capabilities.json").read_bytes()
+    )
+    # the hook env: ONLY ZCODE_PLUGIN_ROOT is set (no AGENTFLOW_CONFIG/_CAPABILITIES),
+    # and the process cwd is some unrelated target project.
+    target_project = tmp_path / "target_project"
+    target_project.mkdir()
+    monkeypatch.chdir(target_project)
+    monkeypatch.setenv("ZCODE_PLUGIN_ROOT", str(plugin))
+    monkeypatch.setenv("AGENTFLOW_USER_DATA_ROOT", str(tmp_path / "ud"))
+    monkeypatch.delenv("AGENTFLOW_CONFIG", raising=False)
+    monkeypatch.delenv("AGENTFLOW_CAPABILITIES", raising=False)
+
+    ctx = bootstrap.process_config()
+    assert ctx.plugin_root == plugin.resolve()
+    # the config loaded is the PLUGIN's config.yaml (not a cwd-relative miss)
+    assert ctx.config["human_gates"]["spec_approval"]["allow_non_adversarial_fallback"] is True
+    assert "effective_approval_mode" in ctx.effective_config
+
+
 # ---------------------------------------------------------------------------
 # build_run_context — the SOLE dispatcher
 # ---------------------------------------------------------------------------

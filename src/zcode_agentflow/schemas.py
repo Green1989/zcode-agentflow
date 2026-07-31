@@ -178,16 +178,21 @@ def validate_raw_spec(obj: dict) -> None:
 def validate_raw_plan(obj: dict) -> None:
     """Validate the RAW plan-proposal wrapper (Codex output) + wrapper-status rules.
 
-    Wrapper status semantics (P0-5):
-      READY_FOR_EXECUTION => a plan is present and questions is empty/absent
-      NEEDS_USER_INPUT    => questions non-empty (no plan required)
-      BLOCKED             => block_reason present
+    The wrapper is a fixed-key strict-mode envelope (R2-1): status/plan/questions/
+    block_reason are ALL always present (plan may be null). The per-status semantics
+    are enforced here on top of the structural schema:
+
+      READY_FOR_EXECUTION => plan is a NON-NULL object and questions is empty
+      NEEDS_USER_INPUT    => questions non-empty (plan is null)
+      BLOCKED             => block_reason non-empty (plan is null)
     """
     validate_against(obj, "plan-proposal")
     status = obj["status"]
     if status == "READY_FOR_EXECUTION":
-        if "plan" not in obj:
-            raise SchemaError("status=READY_FOR_EXECUTION requires a plan")
+        # strict-mode envelope always carries the `plan` KEY (possibly null); a
+        # READY wrapper must carry a NON-NULL plan object.
+        if not obj.get("plan"):
+            raise SchemaError("status=READY_FOR_EXECUTION requires a non-null plan")
         questions = obj.get("questions", [])
         if questions:
             raise SchemaError(

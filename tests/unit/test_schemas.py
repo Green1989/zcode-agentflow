@@ -132,6 +132,9 @@ def _raw_plan_proposal_ready():
             "plan_markdown": "# PLAN\n\nSingle-task plan body.",
             "tasks": [_raw_plan_task()],
         },
+        # R2-1: strict-mode envelope — all keys always present.
+        "questions": [],
+        "block_reason": "",
     }
 
 
@@ -141,15 +144,20 @@ def test_raw_plan_ready_for_execution_passes():
 
 def test_raw_plan_needs_user_input_passes():
     """P0-5: the wrapper lets a multi-task goal fail cleanly — NEEDS_USER_INPUT
-    carries questions instead of a plan."""
+    carries questions instead of a plan. R2-1: strict-mode envelope always carries
+    plan/questions/block_reason; for NEEDS_USER_INPUT plan is null."""
     schemas.validate_raw_plan(
         {"status": "NEEDS_USER_INPUT",
-         "questions": ["Should the new API be async?"]}
+         "plan": None,
+         "questions": ["Should the new API be async?"],
+         "block_reason": ""}
     )
 
 
 def test_raw_plan_blocked_passes():
-    schemas.validate_raw_plan({"status": "BLOCKED", "block_reason": "no tests exist"})
+    schemas.validate_raw_plan(
+        {"status": "BLOCKED", "plan": None, "questions": [], "block_reason": "no tests exist"}
+    )
 
 
 def test_raw_plan_two_tasks_rejected():
@@ -652,27 +660,38 @@ def test_raw_model_facing_schemas_are_self_contained():
         )
 
 
-@pytest.mark.xfail(reason=(
-    "KNOWN v1 blocker (AF-7, 2026-07-31): codex response_format uses STRICT-mode "
-    "structured outputs, which require every object's `required` to list ALL its "
-    "properties (no optional fields). spec-draft-output passes (all-required); "
-    "plan-proposal currently models plan/questions/block_reason as OPTIONAL (a "
-    "union over status) and is rejected with 'required ... Missing plan'. "
-    "Resolving it needs a RAW-schema variant redesign (the engine's wrapper-"
-    "status logic depends on optionality), tracked separately. Marked xfail so "
-    "the gap is visible without blocking the suite."
-))
 def test_raw_plan_schema_is_strict_mode_compliant():
-    """The plan-proposal RAW schema must satisfy codex's strict-mode structured-"
-    "outputs rule: every object's `required` lists ALL its property keys. See the
-    xfail reason — this is the documented, not-yet-resolved Layer-3 blocker."""
+    """R2-1 (was the AF-7 xfailed blocker, now resolved) — the plan-proposal RAW
+    schema must satisfy codex's strict-mode structured-outputs rule: every
+    object's `required` lists ALL its property keys (no optional fields), so the
+    schema uploads cleanly to a model-API response_format. The wrapper models the
+    status-union via a fixed-key envelope (plan is nullable) instead of optional
+    keys, and schemas.validate_raw_plan enforces the per-status semantics."""
     import json
     schemas_dir = Path(__file__).resolve().parents[2] / "schemas"
     schema = json.loads((schemas_dir / "plan-proposal.schema.json")
                         .read_text(encoding="utf-8"))
-    props = set(schema.get("properties", {}).keys())
-    required = set(schema.get("required", []))
-    assert props <= required, (
-        f"strict mode requires ALL properties in `required`; missing: "
-        f"{props - required}"
-    )
+
+    def _all_required(obj):
+        # every object in the schema must list ALL its properties in `required`
+        props = obj.get("properties", {})
+        if props:
+            required = set(obj.get("required", []))
+            missing = set(props) - required
+            assert not missing, (
+                f"strict mode: object has properties not in `required`: {missing}"
+            )
+        # recurse into nested object properties
+        for p in props.values():
+            if isinstance(p, dict) and "type" in p:
+                # type may be a single object schema or ["object", "null"]
+                types = p["type"] if isinstance(p["type"], list) else [p["type"]]
+                if "object" in types:
+                    _all_required(p)
+            if "$ref" in p and p["$ref"] == "#/definitions/plannedChanges":
+                pass  # checked via definitions below
+
+    _all_required(schema)
+    for name, d in schema.get("definitions", {}).items():
+        if d.get("type") == "object":
+            _all_required(d)

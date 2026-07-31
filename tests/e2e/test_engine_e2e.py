@@ -101,6 +101,9 @@ class FakeCodex:
                         }
                     ],
                 },
+                # R2-1: strict-mode envelope — all keys always present.
+                "questions": [],
+                "block_reason": "",
             }
         else:
             raise RuntimeError(f"unknown codex kind {kind!r}")

@@ -96,6 +96,11 @@ def test_raw_plan_rejects_authoritative_fields():
     """consistency #1: the RAW plan-proposal schema REJECTS any envelope
     containing base_commit / run_id / hashes — the model cannot emit them, so
     there is no 'compare Codex's base_commit' step. The engine injects them."""
+    def _ready(plan):
+        # R2-1: strict-mode envelope — all top-level keys always present.
+        return {"status": "READY_FOR_EXECUTION", "plan": plan,
+                "questions": [], "block_reason": ""}
+
     base_task = {
         "id": "T001",
         "title": "t",
@@ -114,47 +119,32 @@ def test_raw_plan_rejects_authoritative_fields():
     }
 
     # base valid RAW plan
-    valid = {
-        "status": "READY_FOR_EXECUTION",
-        "plan": {"plan_markdown": "# PLAN", "tasks": [dict(base_task)]},
-    }
+    valid = _ready({"plan_markdown": "# PLAN", "tasks": [dict(base_task)]})
     schemas.validate_raw_plan(valid)  # baseline passes
 
     # adding run_id at the wrapper level is rejected
-    bad = {
-        "status": "READY_FOR_EXECUTION",
-        "plan": {"plan_markdown": "# PLAN", "tasks": [dict(base_task)]},
-        "run_id": RUN_ID,
-    }
+    bad = _ready({"plan_markdown": "# PLAN", "tasks": [dict(base_task)]})
+    bad["run_id"] = RUN_ID
     with pytest.raises(schemas.SchemaError):
         schemas.validate_raw_plan(bad)
 
     # adding base_commit at the plan level is rejected
-    bad = {
-        "status": "READY_FOR_EXECUTION",
-        "plan": {"plan_markdown": "# PLAN", "base_commit": BASE_COMMIT,
-                 "tasks": [dict(base_task)]},
-    }
+    bad = _ready({"plan_markdown": "# PLAN", "base_commit": BASE_COMMIT,
+                  "tasks": [dict(base_task)]})
     with pytest.raises(schemas.SchemaError):
         schemas.validate_raw_plan(bad)
 
     # adding base_commit at the TASK level is rejected (engine injects it)
     bad_task = dict(base_task)
     bad_task["base_commit"] = BASE_COMMIT
-    bad = {
-        "status": "READY_FOR_EXECUTION",
-        "plan": {"plan_markdown": "# PLAN", "tasks": [bad_task]},
-    }
+    bad = _ready({"plan_markdown": "# PLAN", "tasks": [bad_task]})
     with pytest.raises(schemas.SchemaError):
         schemas.validate_raw_plan(bad)
 
     # adding a hash anywhere in the task is rejected
     bad_task = dict(base_task)
     bad_task["plan_sha256"] = HASH64
-    bad = {
-        "status": "READY_FOR_EXECUTION",
-        "plan": {"plan_markdown": "# PLAN", "tasks": [bad_task]},
-    }
+    bad = _ready({"plan_markdown": "# PLAN", "tasks": [bad_task]})
     with pytest.raises(schemas.SchemaError):
         schemas.validate_raw_plan(bad)
 

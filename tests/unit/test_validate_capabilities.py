@@ -155,14 +155,16 @@ def test_validate_against_real_config_and_findings():
 
     Real environment (capabilities.json): tool_confirmation is value=false
     (the env runs yolo/bypass — MCP-level mandatory confirmation is NOT enforced),
-    class=fallback-capable, fallback=non_adversarial_convention. The committed
-    config.yaml sets allow_non_adversarial_fallback=false (the honest default,
-    Spec §5.4 / G6: do NOT silently degrade). Therefore validate_capabilities
-    MUST raise CapabilityError on startup against the committed pair — proving
-    the gate is real and the default is "fail loud", not "silently degrade".
+    class=fallback-capable, fallback=non_adversarial_convention. R2-3 (P0-3):
+    the committed config.yaml ships allow_non_adversarial_fallback=true
+    (capabilities tool_confirmation is value:false in this env, defaultMode=yolo),
+    so validate_capabilities RESOLVES to the non_adversarial_convention fallback
+    (not raise) — the server can start, with the canonical security_warning
+    surfaced (approval.py / plugin.json). This is the documented reduced-assurance
+    state for an env where tool-level confirmation is not configured.
 
-    If the committed config ever flips to allow_non_adversarial_fallback=true,
-    this assertion must flip to expecting success — update it deliberately.
+    If the committed config flips back to false, this assertion must flip to
+    expecting CapabilityError (G6 fail-loud) — update it deliberately.
     """
     from pathlib import Path
     import json
@@ -172,5 +174,5 @@ def test_validate_against_real_config_and_findings():
     findings = json.loads(
         (repo_root / "docs" / "capabilities.json").read_text(encoding="utf-8")
     )
-    with pytest.raises(CapabilityError):
-        validate_capabilities(cfg, findings["gates"])
+    effective = validate_capabilities(cfg, findings["gates"])
+    assert effective["effective_approval_mode"] == "non_adversarial_convention"
