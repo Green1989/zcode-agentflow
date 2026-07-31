@@ -43,12 +43,15 @@ __all__ = [
     "BLOBS_DIRNAME",
     "MANIFEST_FILENAME",
     "NAME_TO_STATE_SHA",
+    "LOCKED_ARTIFACT_NAMES",
     "ArtifactNotFound",
     "ArtifactCorrupt",
+    "ArtifactMismatch",
     "Generation",
     "ArtifactResolver",
     "prepare_generation",
     "load_generation",
+    "verify_locked_artifacts",
 ]
 
 ARTIFACTS_DIRNAME = "artifacts"
@@ -79,6 +82,20 @@ class ArtifactCorrupt(RuntimeError):
     recorded sha (tampering / corruption / disk rot). Reading and recovery fail
     CLOSED on this rather than serving or rehydrating corrupt content (P0-3,
     Spec §4.7 integrity)."""
+
+
+class ArtifactMismatch(RuntimeError):
+    """Raised by :func:`verify_locked_artifacts` when a locked artifact's current
+    on-disk sha (recomputed via the resolver) does NOT equal the sha recorded in
+    the committed state — i.e. the approved/locked view drifted from disk after
+    the gate (Review §五; P0-3). Distinct from :class:`ArtifactCorrupt`, which is
+    a blob-vs-its-own-manifest mismatch; this is a state-vs-disk mismatch."""
+
+
+# The logical artifacts whose sha is LOCKED at a gate and re-checked at every
+# later gate (Prompt §14; Spec §4.7). The Engine rehashes these from disk via
+# the ArtifactResolver at begin/finish of every operation.
+LOCKED_ARTIFACT_NAMES = ("SPEC.md", "PLAN.md", "task-manifest.json")
 
 
 @dataclass
@@ -290,3 +307,50 @@ class ArtifactResolver:
                 f"{ref['sha256']!r} != on-disk {actual!r} at {ref['blob']!r}"
             )
         return actual
+
+
+# ===========================================================================
+# Gate-time rehash (Task 6.1; Prompt §14; Review §五; P0-3)
+#
+# Every Engine operation rehashes the LOCKED artifacts (SPEC/PLAN/manifest) from
+# disk and compares to the sha recorded in the committed state. A drift (a SPEC
+# rewritten post-approval as a new generation, or a blob mutated on disk) is the
+# exact post-approval tamper window complete_task must defend against. The read
+# goes through the ArtifactResolver (never a control_root root file — P0-3).
+# ===========================================================================
+
+
+def verify_locked_artifacts(state, resolver: "ArtifactResolver") -> None:
+    """Rehash the locked artifacts from disk and compare to the committed shas.
+
+    For each of :data:`LOCKED_ARTIFACT_NAMES`, if the state carries a locked sha
+    for it, recompute the sha of the current generation's blob (via the resolver
+    — the ONLY read path) and raise :class:`ArtifactMismatch` on drift.
+
+    An artifact the state has NOT yet locked (sha is None) is skipped: a fresh
+    run has no SPEC/PLAN yet. A None sha paired with a present-on-disk artifact
+    is fine for this check — locking happens at the gate that creates it.
+
+    Note: ``resolver.hash_of`` itself raises :class:`ArtifactCorrupt` if a blob's
+    bytes disagree with its OWN manifest sha (a tamper of the committed bytes).
+    Both failure modes (ArtifactCorrupt: blob-vs-manifest; ArtifactMismatch:
+    state-vs-disk) route the run to NEEDS_HUMAN at the engine layer.
+    """
+    for name in LOCKED_ARTIFACT_NAMES:
+        locked = getattr(state, NAME_TO_STATE_SHA[name], None)
+        if locked is None:
+            continue  # this artifact is not locked yet in this run
+        try:
+            current = resolver.hash_of(name)
+        except ArtifactNotFound:
+            # the artifact was locked but the current generation no longer has
+            # it — that is a drift too (the locked view is gone).
+            raise ArtifactMismatch(
+                f"locked artifact {name!r} (state sha {locked!r}) is absent from "
+                f"the current generation"
+            )
+        if current != locked:
+            raise ArtifactMismatch(
+                f"locked artifact {name!r} sha drifted: state holds {locked!r} "
+                f"but the current generation's blob hashes to {current!r}"
+            )
