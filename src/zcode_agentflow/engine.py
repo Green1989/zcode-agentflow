@@ -169,10 +169,21 @@ class Engine:
         # rehash the locked artifacts against the post-begin state. The state
         # did not change its artifact_generation during begin (only revision +
         # active_operation_id), so this validates the SAME committed generation.
-        state = store.State.load(self.roots.control_root)
-        artifacts.verify_locked_artifacts(
-            state, ArtifactResolver(self.roots.control_root, state)
-        )
+        # If the rehash detects drift/tampering, the op is already ACTIVE on disk
+        # (begin committed the intermediate state + active op). We must route it
+        # to NEEDS_HUMAN via fail_operation (using br's lease) BEFORE re-raising,
+        # so the run is never stranded mid-external (P0-2).
+        try:
+            state = store.State.load(self.roots.control_root)
+            artifacts.verify_locked_artifacts(
+                state, ArtifactResolver(self.roots.control_root, state)
+            )
+        except BaseException:
+            self.store.fail_operation(
+                operation_id=operation_id, lease_token=br.lease_token,
+                reason=f"{tool} artifact rehash failed at begin",
+            )
+            raise
         return br
 
     # ------------------------------------------------------------------
@@ -874,6 +885,71 @@ class Engine:
             self.store.fail_operation(
                 operation_id=op_id, lease_token=br.lease_token,
                 reason="reviewer_review_task failure",
+            )
+            raise
+
+    # ==================================================================
+    # Tool 8: workflow_complete_task (full hard checks + READY_TO_MERGE)
+    # ==================================================================
+
+    def workflow_complete_task(self, *, task_id: str, expected_revision: int) -> dict:
+        """REVIEWING_TASK(PASS) → READY_TO_MERGE (v1 terminal state).
+
+        Runs the FULL hard-check set (≥11; Spec §5.1 + Prompt §14 on-disk rehash),
+        all inside the begin critical section (CAS) + the shared hard-check
+        primitives. On ANY failure the run routes to NEEDS_HUMAN (no partial
+        completion). On full success it reaches READY_TO_MERGE — NO merge, NO
+        push (the merge is performed by the human, outside AgentFlow, in v1).
+
+        Task 6.8 marks the active-run pointer ``terminal:true`` on
+        READY_TO_MERGE (this task reaches the state; the pointer mark is the
+        pointer-lifecycle concern).
+        """
+        ids.validate_task_id(task_id)
+        state = self._load_state()
+        op_id = self._op_id("workflow_complete_task", expected_revision)
+        request = {"tool": "workflow_complete_task",
+                   "args": {"task_id": task_id, "expected_revision": expected_revision}}
+        br = self._begin(
+            tool="workflow_complete_task", operation_id=op_id, request=request,
+            expected_revision=expected_revision,
+            intermediate_state="REVIEWING_TASK", replay_policy="SAFE_READ",
+        )
+        try:
+            # run the shared hard-check set (Review §六.6: same primitives as
+            # check_stop — hook and engine never drift).
+            checks = self._hard_checks()
+            hard = HardCheckResult.from_checks(checks)
+            if not hard.allow:
+                # any failing hard check => the run is NOT safe to complete.
+                # Raise so the abnormal path (fail_operation → NEEDS_HUMAN) routes
+                # the run consistently with every other tool's failure semantics.
+                raise WorkflowError(
+                    f"workflow_complete_task hard checks failed: {hard.reasons}"
+                )
+            committed = self.store.finish_operation(
+                operation_id=op_id, lease_token=br.lease_token,
+                expected_revision=br.revision_after_begin,
+                next_state="READY_TO_MERGE", staged_artifacts={},
+                result={"hard_checks": [list(c) for c in checks]},
+            )
+            st = self._load_state()
+            # mark the active-run pointer terminal (Task 6.8 lifecycle). The
+            # pointer is retained (NOT cleared) so workflow_status can read the
+            # final READY_TO_MERGE handoff; it is cleared only on new init /
+            # abandon / archive.
+            if self.user_data_root is not None:
+                from zcode_agentflow import active_run as _active_run
+                with _active_run.ActiveRunRegistry.locked(self.user_data_root) as registry:
+                    registry.mark_terminal_locked(st.run_id)
+            return {
+                "state": committed["state"], "revision": committed["revision"],
+                "checks": [list(c) for c in checks], "operation_id": op_id,
+            }
+        except BaseException:
+            self.store.fail_operation(
+                operation_id=op_id, lease_token=br.lease_token,
+                reason="workflow_complete_task failure",
             )
             raise
 
