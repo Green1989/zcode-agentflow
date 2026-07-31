@@ -816,6 +816,13 @@ class Store:
             # 1. load or rebuild state.json
             state = self._load_or_rebuild_state()
 
+            # 1a. integrity-check the generation the recovered state points at
+            # (Spec §4.7, P0-3): recompute each blob's sha against the manifest
+            # and FAIL CLOSED on a mismatch (tampering / corruption / disk rot)
+            # rather than rehydrating corrupt content. A state with no current
+            # generation (no artifacts yet) trivially passes.
+            self._verify_generation_blobs(state)
+
             # 1b. reconcile the op named by the latest event. If a finish
             # committed the state.json but crashed BEFORE op.mark_committed()
             # (crash points finish_after_state_replace / finish_after_event),
@@ -942,6 +949,40 @@ class Store:
             # authoritative fields the finish folded into its commit (P0-2):
             state.base_commit = rolled.base_commit
             op.mark_committed()
+
+    def _verify_generation_blobs(self, state: State) -> None:
+        """Integrity-check the generation ``state.artifact_generation`` points
+        at (Spec §4.7, P0-3). Recompute each blob's sha against the manifest and
+        raise :class:`artifacts.ArtifactCorrupt` on any mismatch. A state with
+        no current generation (no artifacts committed yet) passes trivially.
+
+        This closes the gap that the promotion test only verified
+        freshly-written normal blobs: recovery now detects a blob that was
+        tampered after it was committed.
+        """
+        from zcode_agentflow import artifacts as _artifacts
+
+        gen_id = getattr(state, "artifact_generation", None)
+        if not gen_id:
+            return
+        try:
+            gen = _artifacts.load_generation(self.control_root, gen_id)
+        except FileNotFoundError:
+            return  # state points at a generation whose manifest is gone; the
+            # caller's later ArtifactResolver read will raise ArtifactNotFound —
+            # not an integrity failure to fabricate here.
+        for name, ref in gen.index.items():
+            bpath = self.control_root / ref["blob"]
+            if not bpath.exists():
+                # missing blob is a different failure; let read() surface it.
+                continue
+            actual = canonical.sha256_hex(bpath.read_bytes())
+            if actual != ref["sha256"]:
+                raise _artifacts.ArtifactCorrupt(
+                    f"artifact {name!r} blob sha mismatch during recovery: "
+                    f"manifest {ref['sha256']!r} != on-disk {actual!r} at "
+                    f"{ref['blob']!r}"
+                )
 
     def _load_or_rebuild_state(self) -> State:
         """Load state.json; on corruption/absence, rebuild from the latest

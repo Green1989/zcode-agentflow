@@ -44,6 +44,7 @@ __all__ = [
     "MANIFEST_FILENAME",
     "NAME_TO_STATE_SHA",
     "ArtifactNotFound",
+    "ArtifactCorrupt",
     "Generation",
     "ArtifactResolver",
     "prepare_generation",
@@ -71,6 +72,13 @@ NAME_TO_STATE_SHA = {
 class ArtifactNotFound(KeyError):
     """Raised when an :class:`ArtifactResolver` is asked for a logical name that
     is not present in the currently-visible generation."""
+
+
+class ArtifactCorrupt(RuntimeError):
+    """Raised when a logical artifact's blob sha does not match the manifest's
+    recorded sha (tampering / corruption / disk rot). Reading and recovery fail
+    CLOSED on this rather than serving or rehydrating corrupt content (P0-3,
+    Spec §4.7 integrity)."""
 
 
 @dataclass
@@ -239,11 +247,24 @@ class ArtifactResolver:
         return gen.index[logical_name]
 
     def read(self, logical_name: str) -> bytes:
-        """Return the canonical bytes of ``logical_name`` from the current gen."""
+        """Return the canonical bytes of ``logical_name`` from the current gen.
+
+        Integrity-checked (Spec §4.7, P0-3): the blob's SHA-256 is recomputed
+        over the bytes on disk and compared to the manifest's recorded sha. A
+        mismatch (tampering / corruption / disk rot) raises
+        :class:`ArtifactCorrupt` rather than returning corrupt content.
+        """
         ref = self._ref(logical_name)
         # ref["blob"] is relative to control_root (e.g. artifacts/blobs/<sha>)
         bpath = self.control_root / ref["blob"]
-        return bpath.read_bytes()
+        data = bpath.read_bytes()
+        actual = canonical.sha256_hex(data)
+        if actual != ref["sha256"]:
+            raise ArtifactCorrupt(
+                f"artifact {logical_name!r} blob sha mismatch: manifest "
+                f"{ref['sha256']!r} != on-disk {actual!r} at {ref['blob']!r}"
+            )
+        return data
 
     def read_text(self, logical_name: str) -> str:
         """Return ``logical_name`` decoded as canonical UTF-8 text (exactly one

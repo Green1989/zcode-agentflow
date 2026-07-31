@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from zcode_agentflow import artifacts as _artifacts
 from zcode_agentflow import canonical, gitops
 
 __all__ = ["BUNDLE_DIRNAME", "REQUIRED_FILES", "assemble", "bundle_dir"]
@@ -92,11 +93,15 @@ def assemble(
 
     # 1. resolved logical artifacts (SPEC/PLAN/manifest/execution-result).
     #    execution-result may be absent in the resolver; fall back to the
-    #    caller-supplied exec_result dict so the bundle is complete.
+    #    caller-supplied exec_result dict ONLY for ArtifactNotFound (the name is
+    #    legitimately absent before the first verify). Any other exception — in
+    #    particular ArtifactCorrupt (P0-3) — must PROPAGATE, not be masked into
+    #    the caller's object, so generation/blob corruption surfaces instead of
+    #    silently degrading the review input.
     for name in _RESOLVED_NAMES:
         try:
             data = resolver.read(name)
-        except Exception:
+        except _artifacts.ArtifactNotFound:
             # execution-result.json is the only one that may legitimately be
             # absent; derive it from the caller's exec_result.
             if name == "execution-result.json":
