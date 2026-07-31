@@ -58,6 +58,13 @@ verification:                   # layer 1: verification command policy
     cwd_must_be_within: run_worktree_root
     network_policy: advisory_only   # honest: v1 advisory only, NOT an enforced deny
     secret_redaction: true
+  # Task 4.4 (P1-2, parallel P1-3): TWO distinct structured allowlists.
+  # These are the security source for run_verification; AGENTS.md is
+  # context-only and NEVER a security source.
+  #   program_allowlist     — governs kind=executable (the program itself)
+  #   interpreter_allowlist — governs kind=cmd_script / bash_script
+  program_allowlist: [python, pytest, npm]
+  interpreter_allowlist: [cmd.exe, bash]
 
 change_policy:                  # layer 2: git change audit policy
   on_unauthorized_delete: NEEDS_HUMAN

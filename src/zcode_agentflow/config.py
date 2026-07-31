@@ -146,6 +146,19 @@ CONFIG_SCHEMA = {
                         "secret_redaction": {"type": "boolean"},
                     },
                 },
+                # Task 4.4 (P1-2, parallel P1-3): TWO distinct structured
+                # allowlists. These are OPTIONAL (default []) so a config
+                # without them still validates; the engine supplies runtime
+                # allowlists when invoking run_verification. AGENTS.md is
+                # context-only and is NEVER a security source.
+                "program_allowlist": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1},
+                },
+                "interpreter_allowlist": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1},
+                },
             },
         },
         "change_policy": {

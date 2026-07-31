@@ -108,6 +108,40 @@ def test_defaults_applied_for_missing_optional(tmp_path):
     assert isinstance(wf["max_replan_rounds"], int)
 
 
+def test_verification_allowlists_present_and_typed():
+    """Task 4.4 (P1-2, parallel P1-3): production config carries the two
+    structured verification allowlists (program_allowlist for kind=executable;
+    interpreter_allowlist for kind=cmd_script/bash_script)."""
+    cfg = config_mod.load(PROD_CONFIG)
+    v = cfg["verification"]
+    assert isinstance(v["program_allowlist"], list)
+    assert isinstance(v["interpreter_allowlist"], list)
+    assert "python" in v["program_allowlist"]
+    assert "cmd.exe" in v["interpreter_allowlist"]
+
+
+def test_verification_allowlists_optional(tmp_path):
+    """The allowlists are OPTIONAL: a config without them still validates (the
+    engine supplies runtime allowlists when invoking run_verification)."""
+    obj = _prod_yaml()
+    obj["verification"].pop("program_allowlist", None)
+    obj["verification"].pop("interpreter_allowlist", None)
+    p = _write(tmp_path, obj)
+    cfg = config_mod.load(p)
+    # absent => not present (no default injected; caller supplies at call time)
+    assert "program_allowlist" not in cfg["verification"]
+    assert "interpreter_allowlist" not in cfg["verification"]
+
+
+def test_verification_allowlist_wrong_type_rejected(tmp_path):
+    """The allowlists must be arrays of non-empty strings (strict schema)."""
+    obj = _prod_yaml()
+    obj["verification"]["program_allowlist"] = "python"  # not an array
+    p = _write(tmp_path, obj)
+    with pytest.raises(Exception):
+        config_mod.load(p)
+
+
 def test_capabilities_block_sourced_from_findings(capabilities: dict):
     """The `capabilities:` block in config.yaml mirrors the Phase 0 gates in
     docs/capabilities.json (P1-2)."""
