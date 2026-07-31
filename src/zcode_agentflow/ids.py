@@ -152,6 +152,7 @@ def normalize_branch(*, prefix: str, run_id: str) -> str:
         result = subprocess.run(
             ["git", "check-ref-format", "--branch", ref],
             capture_output=True,
+            stdin=subprocess.DEVNULL,
             timeout=10,
         )
     except (FileNotFoundError, OSError) as exc:

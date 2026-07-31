@@ -53,11 +53,14 @@ def _run(args, *, cwd, check: bool = True) -> bytes:
     """Run ``git <args>`` in ``cwd`` and return its raw stdout bytes.
 
     Uses capture_output (never lets git write to the parent stdout — important
-    for the MCP server's clean-stdout invariant, P1-6). On failure raises
-    GitError with the stderr message (unless check=False).
+    for the MCP server's clean-stdout invariant, P1-6). stdin is always
+    DEVNULL so git never inherits the MCP protocol pipe (a credential helper
+    or pager reading stdin would hang the server forever under stdio transport).
+    On failure raises GitError with the stderr message (unless check=False).
     """
     result = subprocess.run(
         ["git", *args], cwd=str(cwd), capture_output=True,
+        stdin=subprocess.DEVNULL,
     )
     if check and result.returncode != 0:
         err = result.stderr.decode("utf-8", "replace").strip()
@@ -70,7 +73,7 @@ def is_git_repo(path) -> bool:
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--is-inside-work-tree"],
-            cwd=str(path), capture_output=True,
+            cwd=str(path), capture_output=True, stdin=subprocess.DEVNULL,
         )
     except (FileNotFoundError, OSError):
         return False
@@ -145,7 +148,7 @@ def branch_exists(target_repo, branch: str) -> bool:
     """True iff ``branch`` exists in ``target_repo`` (local refs)."""
     result = subprocess.run(
         ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
-        cwd=str(target_repo), capture_output=True,
+        cwd=str(target_repo), capture_output=True, stdin=subprocess.DEVNULL,
     )
     return result.returncode == 0
 
