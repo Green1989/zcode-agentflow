@@ -955,9 +955,15 @@ class Engine:
                 from zcode_agentflow import active_run as _active_run
                 with _active_run.ActiveRunRegistry.locked(self.user_data_root) as registry:
                     registry.mark_terminal_locked(st.run_id)
+            # Task 8.4: attach the READY_TO_MERGE handoff (a side-effect-free
+            # read of committed state + artifacts). The supervisor presents
+            # branch/HEAD/changed-files/review to the user and stops — AgentFlow
+            # never pushes/merges/opens a PR (Prompt §22; Review §六.10).
+            from zcode_agentflow import handoff as _handoff
             return {
                 "state": committed["state"], "revision": committed["revision"],
                 "checks": [list(c) for c in checks], "operation_id": op_id,
+                "handoff": _handoff.build_handoff(self),
             }
         except BaseException:
             # Once finish commits, the lease is cleared and fail_operation would
