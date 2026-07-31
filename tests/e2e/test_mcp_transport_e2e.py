@@ -295,3 +295,51 @@ async def test_stdio_rejection_returns_mcp_error_and_keeps_server_alive(tmp_path
         status = _payload(alive)
         assert status["active_run"]["run_id"] == "20260730120000-abc2de"
         assert status["active_run"]["state"] == "READY_FOR_SPEC_APPROVAL"
+
+
+@pytest.mark.anyio
+async def test_stdio_stale_revision_cas_rejection(tmp_path):
+    """AF-6 (audit-fix) — the CAS-mismatch rejection (a core matrix path, Prompt
+    §21 'stale revision') replayed over the REAL MCP transport: a state-changing
+    call with a stale expected_revision returns an MCP error result (not a crash),
+    and the server stays alive. Complements the illegal-state rejection above with
+    the concurrent-update (CAS) path."""
+    repo = _make_repo(tmp_path)
+    plugin = _plugin_root(tmp_path)
+    user_data = tmp_path / "user_data"
+    user_data.mkdir()
+    ctx_json = _run_context_json(plugin_root=plugin, user_data_root=user_data)
+
+    async with sdk_session(ctx_json) as session:
+        # init + draft to reach READY_FOR_SPEC_APPROVAL.
+        init = _payload(await session.call_tool(
+            "workflow_init",
+            {"target_repo": str(repo), "goal": "cas e2e",
+             "run_id": "20260730120000-cafe01"},
+        ))
+        control = Path(init["control_root"])
+        st = store.State.load(control)
+        _payload(await session.call_tool(
+            "planner_draft_spec",
+            {"goal": "cas e2e", "expected_revision": st.revision},
+        ))
+        # capture a STALE revision, then advance the state so it is stale.
+        stale_rev = store.State.load(control).revision
+        st = store.State.load(control)
+        _payload(await session.call_tool(
+            "workflow_approve_spec", {"expected_revision": st.revision},
+        ))
+        # now call create_plan with the STALE revision -> MCP error (CAS mismatch).
+        bad = await session.call_tool(
+            "planner_create_plan",
+            {"approved_spec_sha256": st.spec_sha256, "expected_revision": stale_rev},
+        )
+        assert bad.isError, "a stale-revision call must return an MCP error result"
+        err_text = "".join(getattr(c, "text", "") or "" for c in (bad.content or []))
+        assert "revision" in err_text.lower() or "cas" in err_text.lower(), (
+            f"the error should mention the revision/CAS mismatch; got: {err_text}"
+        )
+        # server still alive + state unchanged by the rejected call.
+        alive = await session.call_tool("workflow_status", {})
+        assert not alive.isError
+        assert _payload(alive)["active_run"]["state"] == "PLANNING"

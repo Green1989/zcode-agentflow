@@ -532,3 +532,160 @@ def test_approval_fallback_path(tmp_path):
     with pytest.raises(ApprovalUnavailableError):
         run2.engine().workflow_approve_spec(expected_revision=st2.revision)
     assert run2.state().state == "NEEDS_HUMAN"
+
+
+# ============================================================================
+# AF-6 (audit-fix) — completion of the Layer-1 rejection matrix (Prompt §21).
+# The Phase 8 prompt requires: stale revision, artifact mutation, dirty/untracked,
+# verification failure, unauthorized change, stale/mismatched review, restart.
+# Stale review / dirty / restart / multi-task were already covered above; these
+# add the remaining paths so the matrix is complete.
+# ============================================================================
+
+
+@dataclass
+class FailingVerifyCodex:
+    """A FakeCodex whose plan's verification command EXITS NON-ZERO, so
+    workflow_verify_task routes to NEEDS_HUMAN (VERIFICATION_FAILED)."""
+
+    goal: str = "e2e change"
+    calls: list = field(default_factory=list)
+
+    def invoke(self, *, request, repo_cwd, operation_dir, timeout) -> AdapterResult:
+        kind = request["kind"]
+        self.calls.append({"kind": kind})
+        if kind == "draft_spec":
+            raw = {
+                "goal": self.goal,
+                "spec_markdown": "# Spec\n\nFailing-verify case.\n",
+                "questions": [],
+                "assumptions": [],
+            }
+        elif kind == "create_plan":
+            raw = {
+                "status": "READY_FOR_EXECUTION",
+                "plan": {
+                    "plan_markdown": "# Plan\n\nT001 (verify fails).\n",
+                    "tasks": [{
+                        "id": "T001", "title": "failing verify", "dependencies": [],
+                        "declared_files": ["a.txt"],
+                        # a verification command that exits non-zero.
+                        "verification_commands": [
+                            {"kind": "executable", "program": sys.executable,
+                             "args": ["-c", "import sys; sys.exit(2)"], "cwd": ".",
+                             "timeout_sec": 30},
+                        ],
+                        "acceptance_criteria": ["verify fails"],
+                        "planned_changes": {
+                            "may_add_dependencies": False,
+                            "may_run_migrations": False,
+                            "may_delete_files": [],
+                        },
+                    }],
+                },
+            }
+        else:
+            raise RuntimeError(f"unknown codex kind {kind!r}")
+        return AdapterResult(exit_code=0, stdout="", stderr="", artifacts={},
+                             parsed=copy.deepcopy(raw))
+
+
+def _drive_to_executing(run: E2ERun):
+    """Drive NEW → EXECUTING_TASK (so verify-side rejection tests start there)."""
+    eng = run.engine()
+    eng.workflow_init(target_repo=str(run.repo), goal=run.goal, run_id=RUN_ID)
+    st = run.state(); run.engine().planner_draft_spec(goal=run.goal, expected_revision=st.revision)
+    st = run.state(); run.engine().workflow_approve_spec(expected_revision=st.revision)
+    st = run.state(); run.engine().planner_create_plan(approved_spec_sha256=st.spec_sha256, expected_revision=st.revision)
+    st = run.state(); run.engine().workflow_start_task(task_id="T001", expected_revision=st.revision)
+    return run.state()
+
+
+def test_stale_revision_cas_rejected(tmp_path):
+    """A state-changing call with a STALE expected_revision (CAS mismatch) is
+    rejected with store.CasMismatch — never silently applies to a moved state.
+    (Prompt §21 'stale revision'.)"""
+    run = E2ERun(tmp_path)
+    eng = run.engine()
+    eng.workflow_init(target_repo=str(run.repo), goal=run.goal, run_id=RUN_ID)
+    st = run.state()
+    stale_rev = st.revision
+    # advance the revision so stale_rev no longer matches.
+    run.engine().planner_draft_spec(goal=run.goal, expected_revision=st.revision)
+    # now call with the STALE revision -> CasMismatch.
+    with pytest.raises(store.CasMismatch):
+        run.engine().workflow_approve_spec(expected_revision=stale_rev)
+
+
+def test_verification_failure_routes_to_needs_human(tmp_path):
+    """A verification command that exits non-zero => VERIFICATION_FAILED =>
+    NEEDS_HUMAN (never a silent pass to review). (Prompt §21 'verification
+    failure'.)"""
+    run = E2ERun(tmp_path)
+    run.codex = FailingVerifyCodex(goal=run.goal)
+    _drive_to_executing(run)
+    # the executor commits a change (clean worktree); the verification COMMAND
+    # itself fails, so status must be VERIFICATION_FAILED -> NEEDS_HUMAN.
+    run.commit_in_worktree("a.txt", "edited\n", msg="task")
+    st = run.state()
+    res = run.engine().workflow_verify_task(task_id="T001", expected_revision=st.revision)
+    assert res["status"] == "VERIFICATION_FAILED"
+    assert run.state().state == "NEEDS_HUMAN"
+
+
+def test_unauthorized_change_routes_to_needs_human(tmp_path):
+    """Committing a file NOT in declared_files (['a.txt']) => the change audit
+    flags an undeclared change => VERIFICATION_FAILED => NEEDS_HUMAN (never a
+    silent pass). (Prompt §21 'unauthorized change'.)"""
+    run = E2ERun(tmp_path)
+    _drive_to_executing(run)
+    # commit an UNDECLARED file (b.txt is not in declared_files=['a.txt']).
+    run.commit_in_worktree("b.txt", "sneaky undeclared change\n", msg="undeclared")
+    st = run.state()
+    res = run.engine().workflow_verify_task(task_id="T001", expected_revision=st.revision)
+    assert res["status"] == "VERIFICATION_FAILED"
+    assert run.state().state == "NEEDS_HUMAN"
+    # the execution-result records the undeclared change honestly.
+    resolver = artifacts.ArtifactResolver(run.control, run.state())
+    exec_result = json.loads(resolver.read("execution-result.json"))
+    assert exec_result["change_audit"]["undeclared_files_changed"]
+
+
+def test_artifact_mutation_detected_at_complete(tmp_path):
+    """Tampering with a locked artifact's bytes between verify and complete is
+    caught by the on-disk rehash hard checks (Prompt §14 / Review §五) and the
+    complete is refused — never a silent completion. (Prompt §21 'artifact
+    mutation'.)
+
+    The detection surfaces as a WorkflowError whose reasons carry the
+    manifest-vs-on-disk sha mismatch evidence (the run is NOT completed)."""
+    run = E2ERun(tmp_path)
+    # happy path up to REVIEWING_TASK(PASS).
+    _drive_to_executing(run)
+    run.commit_in_worktree("a.txt", "edited\n", msg="task")
+    st = run.state(); run.engine().workflow_verify_task(task_id="T001", expected_revision=st.revision)
+    st = run.state(); run.engine().reviewer_review_task(task_id="T001", expected_revision=st.revision)
+    assert run.state().state == "REVIEWING_TASK"
+    # mutate a locked blob's bytes on disk (the execution-result blob).
+    gen = artifacts.load_generation(run.control, run.state().artifact_generation)
+    entry = gen.index.get("execution-result.json")
+    assert entry, "execution-result.json must be a locked artifact"
+    blob = run.control / entry["blob"]
+    assert blob.exists()
+    original = blob.read_bytes()
+    blob.write_bytes(original + b"\n# TAMPERED\n")  # mutate the authoritative bytes
+    # complete_task's hard-check set rehashes the locked artifacts and detects the
+    # mismatch; the complete is refused (never silently completes to READY_TO_MERGE).
+    from zcode_agentflow.engine import WorkflowError
+    st = run.state()
+    with pytest.raises(WorkflowError) as exc_info:
+        run.engine().workflow_complete_task(task_id="T001", expected_revision=st.revision)
+    msg = str(exc_info.value)
+    assert "mismatch" in msg or "tamper" in msg.lower(), (
+        f"the artifact mutation must be reported as a sha mismatch; got: {msg}"
+    )
+    # the run was NOT completed to READY_TO_MERGE (the tamper blocked it).
+    assert run.state().state != "READY_TO_MERGE"
+    # restore the bytes so the test does not leave the run half-tampered for any
+    # later assertion (defensive; the run is already routed to failure).
+    blob.write_bytes(original)
