@@ -22,6 +22,10 @@ All three adapters (Codex, Grok, Verification) share:
   - timeout kills the process TREE (Windows ``CREATE_NEW_PROCESS_GROUP`` +
     ``taskkill /T /PID``; POSIX ``os.setsid`` + ``SIGKILL`` on the group), so a
     grandchild does not outlive the killed child.
+  - ``env`` (optional): an explicit subprocess environment. Adapters that must
+    inject environment variables the child would not otherwise inherit (e.g.
+    Grok's proxy — G7) pass a full env dict here; default ``None`` inherits the
+    parent's environment.
 """
 
 from __future__ import annotations
@@ -161,6 +165,7 @@ def run_subprocess(
     timeout: int,
     operation_dir,
     raw_debug_log: bool = False,
+    env: dict | None = None,
 ) -> tuple[int, str, str]:
     """Run ``cmd`` (token list, ``shell=False``) and return
     ``(exit_code, stdout, stderr)`` with the P1-4 redaction ordering.
@@ -192,10 +197,13 @@ def run_subprocess(
         )
 
     try:
+        popen_kwargs = _popen_kwargs(cwd)
+        if env is not None:
+            popen_kwargs["env"] = env
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
-            **_popen_kwargs(cwd),
+            **popen_kwargs,
         )
     except FileNotFoundError as exc:
         # missing executable -> surface as a normal failure (non-zero), no hang

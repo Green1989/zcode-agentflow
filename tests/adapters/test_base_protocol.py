@@ -139,8 +139,9 @@ def test_run_subprocess_timeout_kills_process_tree(tmp_path: Path):
     )
     env = dict(os.environ, GC_PID_FILE=str(pid_file))
     start = __import__("time").perf_counter()
-    # run_subprocess does not take an env param; emulate by setting it in the
-    # current process for the duration of the call (the test process is private).
+    # The child reads GC_PID_FILE from its inherited env; set it in the current
+    # process for the duration of the call (run_subprocess defaults to env=None
+    # = inherit, which is what this test exercises).
     saved = os.environ.get("GC_PID_FILE")
     os.environ["GC_PID_FILE"] = str(pid_file)
     try:
