@@ -241,6 +241,44 @@ def test_raw_plan_ready_with_questions_rejected():
         schemas.validate_raw_plan(bad)
 
 
+def test_raw_plan_ready_with_block_reason_rejected():
+    """Round-2 P1: the fixed-key envelope must be INTERNALLY CONSISTENT. A
+    READY_FOR_EXECUTION wrapper carrying a non-empty block_reason is contradictory
+    (block_reason belongs only to BLOCKED) and must be rejected — the engine
+    ignores it today, but the envelope should not carry inconsistent state."""
+    bad = _raw_plan_proposal_ready()
+    bad["block_reason"] = "stale reason"
+    with pytest.raises(schemas.SchemaError):
+        schemas.validate_raw_plan(bad)
+
+
+def test_raw_plan_needs_user_input_with_non_null_plan_rejected():
+    """Round-2 P1: NEEDS_USER_INPUT must carry a NULL plan (the wrapper models a
+    union over status; a non-null plan here is contradictory)."""
+    bad = {"status": "NEEDS_USER_INPUT", "plan": _raw_plan_proposal_ready()["plan"],
+           "questions": ["q?"], "block_reason": ""}
+    with pytest.raises(schemas.SchemaError):
+        schemas.validate_raw_plan(bad)
+
+
+def test_raw_plan_blocked_with_non_null_plan_rejected():
+    """Round-2 P1: BLOCKED must carry a NULL plan (a plan is meaningless when the
+    goal is blocked)."""
+    bad = {"status": "BLOCKED", "plan": _raw_plan_proposal_ready()["plan"],
+           "questions": [], "block_reason": "no tests"}
+    with pytest.raises(schemas.SchemaError):
+        schemas.validate_raw_plan(bad)
+
+
+def test_raw_plan_blocked_with_questions_rejected():
+    """Round-2 P1: BLOCKED must not carry open questions (questions belong only to
+    NEEDS_USER_INPUT)."""
+    bad = {"status": "BLOCKED", "plan": None,
+           "questions": ["why?"], "block_reason": "no tests"}
+    with pytest.raises(schemas.SchemaError):
+        schemas.validate_raw_plan(bad)
+
+
 def test_raw_plan_unknown_field_rejected():
     bad = _raw_plan_proposal_ready()
     bad["surprise"] = 1

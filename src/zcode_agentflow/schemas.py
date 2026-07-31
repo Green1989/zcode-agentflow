@@ -180,32 +180,55 @@ def validate_raw_plan(obj: dict) -> None:
 
     The wrapper is a fixed-key strict-mode envelope (R2-1): status/plan/questions/
     block_reason are ALL always present (plan may be null). The per-status semantics
-    are enforced here on top of the structural schema:
+    are enforced here on top of the structural schema, including FULL internal
+    consistency (round-2 P1): each status pins which of the three payload fields
+    is meaningful, and contradictory fields are rejected (not merely ignored):
 
-      READY_FOR_EXECUTION => plan is a NON-NULL object and questions is empty
-      NEEDS_USER_INPUT    => questions non-empty (plan is null)
-      BLOCKED             => block_reason non-empty (plan is null)
+      READY_FOR_EXECUTION => plan NON-NULL; questions EMPTY; block_reason EMPTY
+      NEEDS_USER_INPUT    => questions NON-EMPTY; plan NULL; block_reason EMPTY
+      BLOCKED             => block_reason NON-EMPTY; plan NULL; questions EMPTY
     """
     validate_against(obj, "plan-proposal")
     status = obj["status"]
+    plan = obj.get("plan")
+    questions = obj.get("questions", [])
+    block_reason = obj.get("block_reason", "")
+
     if status == "READY_FOR_EXECUTION":
-        # strict-mode envelope always carries the `plan` KEY (possibly null); a
-        # READY wrapper must carry a NON-NULL plan object.
-        if not obj.get("plan"):
+        if not plan:
             raise SchemaError("status=READY_FOR_EXECUTION requires a non-null plan")
-        questions = obj.get("questions", [])
         if questions:
             raise SchemaError(
                 "status=READY_FOR_EXECUTION must not carry open questions"
             )
+        if block_reason:
+            raise SchemaError(
+                "status=READY_FOR_EXECUTION must not carry a block_reason"
+            )
     elif status == "NEEDS_USER_INPUT":
-        if not obj.get("questions"):
+        if not questions:
             raise SchemaError(
                 "status=NEEDS_USER_INPUT requires non-empty questions"
             )
+        if plan is not None:
+            raise SchemaError(
+                "status=NEEDS_USER_INPUT must not carry a plan (plan must be null)"
+            )
+        if block_reason:
+            raise SchemaError(
+                "status=NEEDS_USER_INPUT must not carry a block_reason"
+            )
     elif status == "BLOCKED":
-        if not obj.get("block_reason"):
+        if not block_reason:
             raise SchemaError("status=BLOCKED requires block_reason")
+        if plan is not None:
+            raise SchemaError(
+                "status=BLOCKED must not carry a plan (plan must be null)"
+            )
+        if questions:
+            raise SchemaError(
+                "status=BLOCKED must not carry open questions"
+            )
 
 
 def validate_raw_review(obj: dict) -> None:

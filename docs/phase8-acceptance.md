@@ -46,11 +46,14 @@ immediately (allow_non_adversarial_fallback was false while tool_confirmation is
 not configured in this env). R2-3 ships the config with the fallback enabled so
 the server starts, surfacing the canonical security_warning (never hidden).
 
-**9-tool MCP surface** — exactly nine. The live `tools/list` evidence is produced
-by the production-env probe in `tests/unit/test_bootstrap_context.py::
-test_server_uses_production_context_for_workflow_status` (which drives a real
-server subprocess over stdio) and is independently asserted by
-`tests/mcp/test_all_tools_stdio.py`. The nine tools:
+**9-tool MCP surface** — exactly nine. The live `tools/list` evidence over the
+real stdio transport is produced by `tests/mcp/test_all_tools_stdio.py` (which
+drives a real server subprocess and exercises the full happy path through every
+tool). The production-env probe
+`tests/unit/test_bootstrap_context.py::test_server_uses_production_context_for_workflow_status`
+additionally proves a real server subprocess starts under production env and
+that `workflow_status` executes without error (it does NOT itself call
+`tools/list` — the 9-tool count comes from the mcp suite). The nine tools:
 
 ```
 workflow_status, workflow_init, planner_draft_spec, workflow_approve_spec,
