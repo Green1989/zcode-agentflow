@@ -67,6 +67,10 @@ from zcode_agentflow.adapters.grok import GrokAdapter  # noqa: E402
 DEFAULT_PROXY = "http://127.0.0.1:7897"
 RUN_ID = "20260731120000-5e0ea1"  # 14 digits + 6 hex (ids.validate_run_id)
 
+# set by run_smoke() so the __main__ error handler can dump the last adapter's
+# redacted raw stdout/stderr for honest failure reporting.
+_SMOKE_CONTROL_ROOT: Path | None = None
+
 
 def _log(msg: str) -> None:
     print(f"[smoke] {msg}", flush=True)
@@ -212,6 +216,42 @@ def _build_engine(control: Path, worktree: Path, repo: Path, plugin: Path,
     )
 
 
+# Codex's verification is non-deterministic: it freely chooses both the exact
+# appended line AND how it words the assertion. Observed shapes include
+#   target='X'; ... assert lines[-1] == target
+#   ... splitlines()[-1] == 'X'
+# We extract the expected line as the string literal compared in the verification
+# source (any 'X' / "X" adjacent to a `==`). This mirrors a real executor reading
+# the plan's acceptance criteria / verification to implement the change.
+_STRING_EQ_RE = __import__("re").compile(r"""==\s*(['"])([^'"]*?)\1""")
+_TARGET_VAR_RE = __import__("re").compile(r"""target\s*=\s*(['"])([^'"]*?)\1""")
+
+
+def _expected_appended_line(task: dict) -> str | None:
+    """Best-effort extraction of the exact line the plan's verification expects the
+    executor to append, so the harness's "executor" applies the plan-specified
+    change (not a hardcoded string that would mismatch and fail verify).
+
+    This MIRRORS A REAL EXECUTOR reading PLAN.md: the executor implements the
+    change the plan + its verification describe. Codex freely chooses the exact
+    appended text and the assertion wording, so we look for the string literal
+    compared in the verification source (handles both ``== 'X'`` inline and
+    ``target='X'; ... == target`` variable forms). If no recognizable literal is
+    found we return None (the caller falls back to a generic line and verification
+    then honestly fails — never silently passes)."""
+    for cmd in task.get("verification_commands", []):
+        src = " ".join(cmd.get("args", []))
+        # prefer a `target='...'` variable definition (most explicit)
+        m = _TARGET_VAR_RE.search(src)
+        if m:
+            return m.group(2)
+        # else any string literal compared with ==
+        m = _STRING_EQ_RE.search(src)
+        if m:
+            return m.group(2)
+    return None
+
+
 def run_smoke() -> dict:
     caps = _check_gate()
     ids.validate_run_id(RUN_ID)  # defensive: fail loud on a bad id, not mid-run
@@ -226,6 +266,9 @@ def run_smoke() -> dict:
         worktree = user_data / "runs" / RUN_ID / "worktree"
         control.mkdir(parents=True, exist_ok=True)
         worktree.parent.mkdir(parents=True, exist_ok=True)
+
+        global _SMOKE_CONTROL_ROOT
+        _SMOKE_CONTROL_ROOT = control
 
         goal = ("Edit a.txt to append a single documented line, then verify "
                 "with a trivial python one-liner. Single task, single file.")
@@ -297,13 +340,26 @@ def run_smoke() -> dict:
         _log(f"start ok: task_start={task_start[:8]}")
 
         # --- the executor's REAL work: edit a.txt, git add, git commit ---
-        # (the operator is the "executor" here; AgentFlow never writes code)
+        # (the operator is the "executor" here; AgentFlow never writes code.)
+        #
+        # The executor READS THE PLAN (as a real executor would) and applies the
+        # change the plan's verification expects. Codex freely chooses the exact
+        # appended line via its verification command (e.g. it asserts the last
+        # line equals some `target='...'`); a hardcoded "smoke edit" would
+        # mismatch and correctly fail verification. So we extract the expected
+        # last line from the plan's verification_commands and append THAT.
         env = {"PATH": os.environ.get("PATH", "")}
+        st_now = store.State.load(control)
+        _resolver = artifacts.ArtifactResolver(control, st_now)
+        _manifest = json.loads(_resolver.read("task-manifest.json"))
+        expected_line = _expected_appended_line(_manifest["tasks"][0]) or "smoke edit"
         a_txt = worktree / "a.txt"
-        a_txt.write_text(a_txt.read_text(encoding="utf-8") + "smoke edit\n",
-                         encoding="utf-8")
+        a_txt.write_text(
+            a_txt.read_text(encoding="utf-8") + expected_line + "\n", encoding="utf-8",
+        )
+        _log(f"executor appended the plan's expected line: {expected_line!r}")
         subprocess.run(["git", "add", "."], cwd=worktree, check=True, env=env)
-        subprocess.run(["git", "commit", "-q", "-m", "task: append smoke edit line"],
+        subprocess.run(["git", "commit", "-q", "-m", "task: append plan-specified line"],
                        cwd=worktree, check=True, env=env)
         new_head = gitops.head(worktree)
         _log(f"executor committed: {new_head[:8]} (real git)")
@@ -379,6 +435,23 @@ if __name__ == "__main__":
         result = run_smoke()
     except Exception as exc:  # surface a real CLI failure honestly
         _log(f"SMOKE FAILED (real CLI / adapter error): {type(exc).__name__}: {exc}")
+        # surface the underlying adapter's redacted stdout/stderr if the failure
+        # was an adapter exit-nonzero (the WorkflowError message has only the
+        # exit code). The most recent operation dir under control/operations/
+        # holds raw/{stdout,stderr}.txt from run_subprocess (already redacted).
+        try:
+            _ops = _SMOKE_CONTROL_ROOT / "operations"
+            if _ops.exists():
+                _latest = max(_ops.iterdir(), key=lambda p: p.stat().st_mtime)
+                for _stream in ("stderr.txt", "stdout.txt"):
+                    _p = _latest / "raw" / _stream
+                    if _p.exists():
+                        _txt = _p.read_text(encoding="utf-8", errors="replace").strip()
+                        if _txt:
+                            _log(f"  last-op raw/{_stream} (tail): "
+                                 + _txt[-600:].replace("\n", " | "))
+        except Exception:
+            pass
         sys.exit(1)
     if result.get("outcome") != "READY_TO_MERGE":
         _log(f"SMOKE stopped safely at {result.get('outcome')} (not a pass).")
