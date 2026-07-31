@@ -175,6 +175,130 @@ class TestProtectArtifacts:
 
 
 # ===========================================================================
+# protect_artifacts — PRODUCTION layout (P0-3 audit-fix)
+# The real pointer lives at <user_data_root>/active-run.json, and ZCODE_PROJECT_DIR
+# is the PROJECT dir (docs/capabilities.json hook_cwd) — a DIFFERENT directory.
+# The hook MUST resolve via bootstrap.build_run_context() → user_data_root, NOT by
+# looking for the pointer under ZCODE_PROJECT_DIR.
+# ===========================================================================
+
+
+def _write_fallback_config(dest):
+    """A config.yaml copy with allow_non_adversarial_fallback=true so the
+    production capability gate resolves (tool_confirmation=false in this env)."""
+    import yaml
+    repo_root = Path(__file__).resolve().parents[2]
+    cfg = yaml.safe_load((repo_root / "config.yaml").read_text(encoding="utf-8"))
+    cfg["human_gates"]["spec_approval"]["allow_non_adversarial_fallback"] = True
+    dest.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+    return dest
+
+
+def _production_layout(tmp_path: Path) -> dict:
+    """Build the REAL production layout: plugin_root, user_data_root (holding the
+    active-run pointer → control_root), and a SEPARATE project_dir. Returns the
+    paths so a test can point env vars at them.
+
+    This mirrors the deployed shape: the pointer is NOT under the project dir, so
+    a hook that looks for it under ZCODE_PROJECT_DIR would fail-open (the P0-3
+    bug)."""
+    import json as _json
+    plugin = tmp_path / "plugin"
+    plugin.mkdir()
+    user_data = tmp_path / "agentflow-data"
+    user_data.mkdir()
+    control_root = user_data / "runs" / "r1" / "control"
+    for sub in ("operations", "approvals", "reviews", "artifacts/gen1", "blobs"):
+        (control_root / sub).mkdir(parents=True)
+    (control_root / "worktree").mkdir(parents=True)  # NOT protected
+    for name in ("state.json", "events.jsonl"):
+        (control_root / name).write_text("{}", encoding="utf-8")
+    (control_root / "operations" / "op1.json").write_text("{}", encoding="utf-8")
+    (control_root / "artifacts" / "gen1" / "SPEC.md").write_text("# spec",
+                                                                 encoding="utf-8")
+    (control_root / "blobs" / "sha256abc").write_text("blob", encoding="utf-8")
+    # the pointer lives under USER_DATA_ROOT, not the project dir
+    (user_data / "active-run.json").write_text(
+        _json.dumps({"run_id": "r1", "control_root": str(control_root)}),
+        encoding="utf-8",
+    )
+    project_dir = tmp_path / "project"  # the repo being worked on (hook cwd)
+    project_dir.mkdir()
+    cfg = _write_fallback_config(tmp_path / "config.yaml")
+    return {
+        "plugin": plugin,
+        "user_data": user_data,
+        "control_root": control_root,
+        "project_dir": project_dir,
+        "config": cfg,
+    }
+
+
+def _set_production_env(monkeypatch, layout: dict) -> None:
+    """Set the production env (plugin root + user_data_root + config + caps) and
+    ALSO set ZCODE_PROJECT_DIR to the project dir — to prove the hook does NOT
+    rely on ZCODE_PROJECT_DIR to find the pointer."""
+    repo_root = Path(__file__).resolve().parents[2]
+    monkeypatch.setenv("ZCODE_PLUGIN_ROOT", str(layout["plugin"]))
+    monkeypatch.setenv("AGENTFLOW_USER_DATA_ROOT", str(layout["user_data"]))
+    monkeypatch.setenv("AGENTFLOW_CONFIG", str(layout["config"]))
+    monkeypatch.setenv("AGENTFLOW_CAPABILITIES",
+                       str(repo_root / "docs" / "capabilities.json"))
+    # ZCODE_PROJECT_DIR is the PROJECT dir (where the hook's cwd is), NOT where
+    # the pointer lives — a correct hook must ignore this for pointer resolution.
+    monkeypatch.setenv("ZCODE_PROJECT_DIR", str(layout["project_dir"]))
+    # ensure the test-only var is NOT set (we are testing the production path)
+    monkeypatch.delenv("AGENTFLOW_RUN_CONTEXT", raising=False)
+
+
+class TestProtectArtifactsProductionLayout:
+    """The hook must protect control data when the pointer lives under
+    user_data_root (production), even though ZCODE_PROJECT_DIR points elsewhere."""
+
+    def test_denies_edit_when_pointer_under_user_data_root(self, tmp_path,
+                                                            monkeypatch):
+        layout = _production_layout(tmp_path)
+        _set_production_env(monkeypatch, layout)
+        payload = _tool_payload("Write",
+                                {"file_path": str(layout["control_root"] / "state.json")})
+        # RED today: the hook looks under ZCODE_PROJECT_DIR (the project dir),
+        # finds no pointer there, and returns EXIT_ALLOW. GREEN after the fix
+        # resolves via build_run_context() → user_data_root.
+        assert hook_logic.run_protect_artifacts(payload) == hook_logic.EXIT_DENY
+
+    def test_denies_edit_of_physical_artifact_store_in_production(self, tmp_path,
+                                                                   monkeypatch):
+        layout = _production_layout(tmp_path)
+        _set_production_env(monkeypatch, layout)
+        payload = _tool_payload("Edit", {
+            "file_path": str(layout["control_root"] / "blobs" / "sha256abc")
+        })
+        assert hook_logic.run_protect_artifacts(payload) == hook_logic.EXIT_DENY
+
+    def test_allows_worktree_edit_in_production(self, tmp_path, monkeypatch):
+        layout = _production_layout(tmp_path)
+        _set_production_env(monkeypatch, layout)
+        wt_file = layout["control_root"] / "worktree" / "src" / "x.py"
+        wt_file.parent.mkdir(parents=True, exist_ok=True)
+        wt_file.write_text("x = 1", encoding="utf-8")
+        payload = _tool_payload("Write", {"file_path": str(wt_file)})
+        assert hook_logic.run_protect_artifacts(payload) == hook_logic.EXIT_ALLOW
+
+    def test_fails_open_when_no_context_resolvable(self, tmp_path, monkeypatch):
+        """No production env, no ZCODE_PROJECT_DIR with a pointer => fail-open
+        (cannot protect what cannot be located). Unchanged behavior; the fix must
+        not make the hook DENY everything when context is absent."""
+        monkeypatch.delenv("ZCODE_PROJECT_DIR", raising=False)
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+        monkeypatch.delenv("ZCODE_PLUGIN_ROOT", raising=False)
+        monkeypatch.delenv("CLAUDE_PLUGIN_ROOT", raising=False)
+        monkeypatch.delenv("AGENTFLOW_RUN_CONTEXT", raising=False)
+        payload = _tool_payload("Write",
+                                {"file_path": str(tmp_path / "state.json")})
+        assert hook_logic.run_protect_artifacts(payload) == hook_logic.EXIT_ALLOW
+
+
+# ===========================================================================
 # gate_on_stop
 # ===========================================================================
 

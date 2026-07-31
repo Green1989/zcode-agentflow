@@ -106,21 +106,69 @@ def _plugin_root_env_var() -> str | None:
 
     This is the spike-confirmed mechanism (template_vars). The hook NEVER uses a
     hardcoded relative path to find the control root (Review §六.7) — if neither
-    var is set the hook treats the root as unknown."""
+    var is set the hook treats the root as unknown.
+
+    NOTE (P0-3 audit-fix): this is now a SECONDARY dev/legacy fallback. The
+    primary resolution is :func:`_resolve_control_root`, which uses the production
+    run context (`bootstrap.build_run_context()` → `user_data_root`). These vars
+    are the PROJECT dir (docs/capabilities.json `hook_cwd`), NOT the pointer
+    home, so relying on them alone was the P0-3 fail-open bug."""
     return os.environ.get("ZCODE_PROJECT_DIR") or os.environ.get("CLAUDE_PROJECT_DIR")
 
 
-def _resolve_control_root() -> Path | None:
-    """Resolve the active run's control_root from the active-run pointer.
+def _user_data_root_from_context() -> Path | None:
+    """Resolve the active run's ``user_data_root`` (pointer home) via the SAME
+    production path the MCP server uses (Plan erratum 12).
 
-    The plugin root (env var) locates the user_data_root that owns the
-    ``active-run.json`` pointer; the pointer records the run's control_root.
-    Returns None when no env var is set OR no active run exists — the hook then
-    fails OPEN (allows) rather than inventing a path."""
-    plugin_root = _plugin_root_env_var()
-    if plugin_root is None:
+    Uses :func:`bootstrap.build_run_context` — which dispatches to the test path
+    (``AGENTFLOW_RUN_CONTEXT``) or the production path (``process_config``). This
+    is why the hook and the server now agree on where ``active-run.json`` lives.
+
+    Returns None when no context can be built (the hook then falls back to the
+    secondary ZCODE_PROJECT_DIR mechanism, and if THAT is empty, fails open)."""
+    try:
+        from zcode_agentflow import bootstrap
+        ctx = bootstrap.build_run_context()
+        return ctx.user_data_root if ctx is not None else None
+    except Exception:
+        # ContextResolutionError (missing plugin root / bad config) or any import
+        # issue: fall back to the secondary mechanism below; never crash the host.
         return None
-    pointer = Path(plugin_root) / "active-run.json"
+
+
+def _resolve_control_root() -> Path | None:
+    """Resolve the active run's control_root from the active-run pointer (Plan
+    erratum 12).
+
+    PRIMARY path: ``bootstrap.build_run_context()`` → ``user_data_root`` →
+    ``<user_data_root>/active-run.json`` → ``control_root``. This is the SAME
+    mechanism the server uses, so production layout (pointer under
+    ``user_data_root``, NOT under the project dir) resolves correctly.
+
+    SECONDARY fallback: the spike-confirmed ``ZCODE_PROJECT_DIR`` /
+    ``CLAUDE_PROJECT_DIR`` → ``<that dir>/active-run.json`` → ``control_root``.
+    Kept for dev/legacy layouts where the pointer sits directly under the
+    project dir (the original Phase-7 implementation assumed this; the existing
+    unit tests cover it). This is the PROJECT dir per capabilities.json, so it is
+    NOT a reliable pointer home in production — hence secondary.
+
+    Returns None when neither path locates a pointer — the hook then fails OPEN
+    (allows) rather than inventing a path."""
+    # 1. primary: production context (user_data_root)
+    udr = _user_data_root_from_context()
+    cr = _read_control_root_from_pointer_home(udr)
+    if cr is not None:
+        return cr
+    # 2. secondary: ZCODE_PROJECT_DIR / CLAUDE_PROJECT_DIR (dev/legacy)
+    return _read_control_root_from_pointer_home(_plugin_root_env_var())
+
+
+def _read_control_root_from_pointer_home(home: str | Path | None) -> Path | None:
+    """Read ``<home>/active-run.json`` and return its ``control_root``, or None
+    when ``home`` is empty / the pointer is absent / the pointer is malformed."""
+    if home is None:
+        return None
+    pointer = Path(home) / "active-run.json"
     if not pointer.exists():
         return None
     try:
@@ -254,12 +302,13 @@ def _build_engine():
     """Build the workflow Engine for the active run, or None if there is none.
 
     The hook delegates the stop decision to ``engine.check_stop`` (the single
-    read-only source — Review §六.6). Returns None when no run context is
-    configured or there is no active run; in that case the Stop hook allows the
-    stop (nothing to gate)."""
+    read-only source — Review §六.6). Uses :func:`bootstrap.build_run_context`
+    (the sole dispatcher — Plan erratum 9) so production layout resolves the same
+    way as the server. Returns None when no run context is configured or there is
+    no active run; in that case the Stop hook allows the stop (nothing to gate)."""
     try:
         from zcode_agentflow import bootstrap
-        ctx = bootstrap.load_run_context()
+        ctx = bootstrap.build_run_context()
         if ctx is None:
             return None
         try:
