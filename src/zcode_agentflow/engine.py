@@ -48,10 +48,12 @@ from zcode_agentflow import (
     gitops,
     ids,
     manifest,
+    policy_change,
     prompts,
     schemas,
     store,
 )
+from zcode_agentflow.adapters.verification import run_verification
 from zcode_agentflow.artifacts import ArtifactResolver
 
 __all__ = [
@@ -586,6 +588,161 @@ class Engine:
             self.store.fail_operation(
                 operation_id=op_id, lease_token=br.lease_token,
                 reason="planner_create_plan adapter/validate failure",
+            )
+            raise
+
+    # ==================================================================
+    # Tool 5: workflow_start_task (record task_start_commit == HEAD)
+    # ==================================================================
+
+    def workflow_start_task(self, *, task_id: str, expected_revision: int) -> dict:
+        """READY_FOR_EXECUTION → EXECUTING_TASK. Records ``task_start_commit`` =
+        the worktree HEAD at start time (the base the change audit diffs from).
+        No adapter call — pure bookkeeping under one begin/finish transaction.
+        """
+        ids.validate_task_id(task_id)
+        state = self._load_state()
+        op_id = self._op_id("workflow_start_task", expected_revision)
+        request = {"tool": "workflow_start_task",
+                   "args": {"task_id": task_id}}
+        br = self._begin(
+            tool="workflow_start_task", operation_id=op_id, request=request,
+            expected_revision=expected_revision,
+            intermediate_state="EXECUTING_TASK", replay_policy="SAFE_READ",
+        )
+        try:
+            start_commit = gitops.head(self.roots.run_worktree_root)
+            committed = self.store.finish_operation(
+                operation_id=op_id, lease_token=br.lease_token,
+                expected_revision=br.revision_after_begin,
+                next_state="EXECUTING_TASK", staged_artifacts={},
+                result={"task_id": task_id, "task_start_commit": start_commit},
+            )
+            # record task_start_commit in state (authoritative base for the audit).
+            st = self._load_state()
+            st.task_start_commit = start_commit
+            st.save(self.roots.control_root)
+            return {
+                "state": committed["state"], "revision": committed["revision"],
+                "task_start_commit": start_commit, "operation_id": op_id,
+            }
+        except BaseException:
+            self.store.fail_operation(
+                operation_id=op_id, lease_token=br.lease_token,
+                reason="workflow_start_task failure",
+            )
+            raise
+
+    # ==================================================================
+    # Tool 6: workflow_verify_task (verification + change audit; Prompt §16)
+    # ==================================================================
+
+    def workflow_verify_task(self, *, task_id: str, expected_revision: int) -> dict:
+        """EXECUTING_TASK → VERIFYING_TASK (pass) / NEEDS_HUMAN (any failure).
+
+        Two independent policy layers (Spec §5.2/§5.3):
+          1. the verification command policy (run_verification over each
+             task.verification_commands);
+          2. the git change policy (policy_change.audit over
+             task_start_commit..HEAD).
+
+        The worktree MUST be clean + no untracked at verify time (gitops). Any
+        failure (non-zero exit, unauthorized change, dirty tree) routes the run
+        to NEEDS_HUMAN. On full success the execution-result is promoted as a new
+        generation (inheriting SPEC/PLAN/manifest) with status READY_FOR_REVIEW.
+        """
+        ids.validate_task_id(task_id)
+        state = self._load_state()
+        op_id = self._op_id("workflow_verify_task", expected_revision)
+        request = {"tool": "workflow_verify_task",
+                   "args": {"task_id": task_id}}
+        br = self._begin(
+            tool="workflow_verify_task", operation_id=op_id, request=request,
+            expected_revision=expected_revision,
+            intermediate_state="VERIFYING_TASK", replay_policy="UNSAFE_WRITE",
+        )
+        try:
+            wt = self.roots.run_worktree_root
+            resolver = self._resolver(state)
+            # read the task from the manifest (the review-relevant single task).
+            man = json.loads(resolver.read("task-manifest.json"))
+            task = man["tasks"][0]
+
+            # worktree must be clean + no untracked at verify time.
+            clean = gitops.is_clean(wt)
+            untracked = gitops.untracked_files(wt)
+
+            # run each verification command (run_verification; structured).
+            ver_results = []
+            ver_failed = False
+            for cmd in task.get("verification_commands", []):
+                vr = run_verification(
+                    command=cmd, worktree_root=wt,
+                    program_allowlist=self.config.get("verification", {}).get("program_allowlist", []),
+                    interpreter_allowlist=self.config.get("verification", {}).get("interpreter_allowlist", []),
+                    operation_dir=Path(br.staging_dir) / "raw",
+                )
+                ver_results.append({
+                    "command": cmd["program"], "exit_code": vr["exit_code"],
+                    "duration_ms": 0,
+                })
+                if vr["exit_code"] != 0:
+                    ver_failed = True
+
+            # change audit (policy_change) over task_start_commit..HEAD.
+            base = state.task_start_commit or state.base_commit
+            head = gitops.head(wt)
+            audit = policy_change.audit(
+                worktree=wt, base_commit=base, head_commit=head,
+                declared_files=task.get("declared_files", []),
+                planned_changes=task.get("planned_changes", {}),
+                config=self.config,
+            )
+
+            # assemble the execution-result.
+            changed = gitops.changed_files_z(wt, base, head)
+            status = "READY_FOR_REVIEW"
+            if ver_failed or not clean or untracked or audit["needs_human"]:
+                status = "VERIFICATION_FAILED"
+            exec_result = {
+                "run_id": state.run_id, "task_id": task_id, "status": status,
+                "base_commit": base, "head_commit": head,
+                "worktree_clean": clean,
+                "untracked_files": untracked,
+                "verification": ver_results,
+                "changed_files": changed,
+                "change_audit": {
+                    "deleted_files": audit["deleted_files"],
+                    "dependency_files_changed": audit["dependency_files_changed"],
+                    "migrations_added": audit["migrations_added"],
+                    "undeclared_files_changed": audit["undeclared_files_changed"],
+                },
+            }
+            # validate the FINAL execution-result structurally.
+            schemas.validate_against(exec_result, "execution-result")
+            (Path(br.staging_dir) / "out.json").write_text(
+                json.dumps(exec_result, ensure_ascii=False), encoding="utf-8"
+            )
+
+            next_state = "VERIFYING_TASK" if status == "READY_FOR_REVIEW" else "NEEDS_HUMAN"
+            committed = self.store.finish_operation(
+                operation_id=op_id, lease_token=br.lease_token,
+                expected_revision=br.revision_after_begin,
+                next_state=next_state,
+                staged_artifacts={"execution-result.json": canonical.canonical_json_bytes(exec_result)},
+                result=exec_result,
+            )
+            st = self._load_state()
+            assert st.execution_result_sha256 == self._resolver(st).hash_of("execution-result.json")
+            return {
+                "status": status, "state": committed["state"],
+                "revision": committed["revision"],
+                "head_commit": head, "operation_id": op_id,
+            }
+        except BaseException:
+            self.store.fail_operation(
+                operation_id=op_id, lease_token=br.lease_token,
+                reason="workflow_verify_task failure",
             )
             raise
 
