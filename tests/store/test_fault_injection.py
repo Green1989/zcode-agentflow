@@ -292,3 +292,110 @@ def test_recover_safe_read_orphan_eligible_for_replay(tmp_path):
     fresh.recover()
     assert fresh.last_recover_outcome() == "REPLAY"
     assert store.OperationManager(control).open_existing("op_git").status == "UNKNOWN"
+
+
+# --------------------------------------------------------------------------- #
+# Phase 3 prompt §fault-matrix coverage gaps (review P1): finish with no result,
+# multi-blob partial-write, and the external boundary (begin committed but
+# finish never started). These were skipped by the original matrix.
+# --------------------------------------------------------------------------- #
+
+
+def test_finish_with_no_result_commits_and_recovers(tmp_path: Path):
+    """The 'no result' path: finish_operation commits a transition that produced
+    no adapter result (result=None). A crash at the commit point followed by a
+    fresh recover() must still reconstruct the committed state.
+    """
+    control = tmp_path / "control"
+    control.mkdir()
+    _seed(control)
+    s = store.Store(control)
+    br = _begin_op(s)
+
+    # finish with result=None (e.g. a pure state-transition op)
+    s.finish_operation(
+        operation_id=br.operation_id, lease_token=br.lease_token,
+        expected_revision=br.revision_after_begin,
+        next_state="READY_FOR_SPEC_APPROVAL",
+        staged_artifacts={}, result=None,
+    )
+    assert store.State.load(control).state == "READY_FOR_SPEC_APPROVAL"
+
+    # a fresh Store sees the committed state without needing a result
+    fresh = store.Store(control)
+    recovered = fresh.recover()
+    assert recovered.state == "READY_FOR_SPEC_APPROVAL"
+
+
+def test_crash_mid_multiblob_write_leaves_old_generation_visible(tmp_path, crash_env):
+    """Multi-blob write: crash after SOME blobs in a multi-artifact generation
+    are written but before the manifest/state replace. On recover, the OLD
+    generation is entirely visible (no partial new generation leaks), because
+    state.json still points at the old generation.
+    """
+    control = tmp_path / "control"
+    control.mkdir()
+    _seed(control)
+    s = store.Store(control)
+    # gen1: commit SPEC + PLAN together (no crash)
+    br1 = _begin_op(s)
+    _finish_op(s, br1,
+               staged={"SPEC.md": b"# Spec v1\n", "PLAN.md": b"# Plan v1\n"},
+               result={"ok": 1})
+    # move to a state where a second commit can begin
+    st = store.State.load(control)
+    st.state = "PLANNING"
+    st.save(control)
+
+    s2 = store.Store(control)
+    crash_env("finish_after_blobs")  # crash AFTER blobs, BEFORE manifest
+    br2 = s2.begin_operation(
+        operation_id="opB",
+        request={"tool": "planner_create_plan", "args": {}},
+        tool="planner_create_plan",
+        expected_revision=store.State.load(control).revision,
+        intermediate_state="READY_FOR_EXECUTION",
+        replay_policy="COSTFUL_READ",
+    )
+    try:
+        s2.finish_operation(
+            operation_id=br2.operation_id, lease_token=br2.lease_token,
+            expected_revision=br2.revision_after_begin,
+            next_state="READY_FOR_EXECUTION",
+            # multi-blob change: both v2
+            staged_artifacts={"SPEC.md": b"# Spec v2\n", "PLAN.md": b"# Plan v2\n"},
+            result={"ok": 2},
+        )
+    except store.CrashInjected:
+        pass
+
+    fresh = store.Store(control)
+    recovered = fresh.recover()
+    resolver = artifacts.ArtifactResolver(control, recovered)
+    # the OLD generation is fully visible — neither v2 file leaks
+    assert resolver.read_text("SPEC.md") == "# Spec v1\n"
+    assert resolver.read_text("PLAN.md") == "# Plan v1\n"
+
+
+def test_external_boundary_begin_committed_finish_never_started(tmp_path, crash_env):
+    """The 'external boundary' the prompt names: begin has committed (state is
+    the intermediate state, active op set) but the external/finish phase never
+    started (process killed right after begin). recover() must clear the orphan
+    and classify it (COSTFUL_READ => NEEDS_HUMAN), leaving a consistent state."""
+    control = tmp_path / "control"
+    control.mkdir()
+    _seed(control)
+    s = store.Store(control)
+    # crash right after begin commits (before any external work / finish)
+    crash_env("begin_after_event")
+    try:
+        _begin_op(s)
+    except store.CrashInjected:
+        pass
+
+    fresh = store.Store(control)
+    recovered = fresh.recover()
+    # the orphan is classified: COSTFUL_READ with no result => NEEDS_HUMAN
+    assert recovered.active_operation_id is None
+    assert recovered.state in ("DRAFTING_SPEC", "NEEDS_HUMAN")
+
