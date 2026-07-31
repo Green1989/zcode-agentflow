@@ -80,8 +80,16 @@ def workflow_status() -> dict:
 
     Reads the active-run pointer (read-only) and surfaces the run's state, task,
     and revision. No Engine is constructed (this is the read-only status probe).
+
+    Tolerates an unresolvable run context (no test env, no production plugin
+    root): it returns ``{"active_run": None}`` rather than erroring, so a status
+    probe never masks itself behind a configuration problem. The 7 state-change
+    tools still fail loud on a missing context via :func:`_call_engine`.
     """
-    ctx = bootstrap.load_run_context()
+    try:
+        ctx = bootstrap.build_run_context()
+    except bootstrap.ContextResolutionError:
+        return {"active_run": None}
     if ctx is None:
         return {"active_run": None}
     from zcode_agentflow import active_run as _active_run
@@ -128,7 +136,7 @@ def _call_engine(method: str, **kwargs):
     / ArtifactMismatch / ArtifactCorrupt) propagate so FastMCP maps them to MCP
     error results. A missing run context / no active run is surfaced via
     :class:`_EngineCallError` (also an MCP error result, never a crash)."""
-    ctx = bootstrap.load_run_context()
+    ctx = bootstrap.build_run_context()
     if ctx is None:
         raise _EngineCallError("no run context configured (AGENTFLOW_RUN_CONTEXT unset)")
     eng = bootstrap.build_engine_for_active_run(ctx)
@@ -144,7 +152,7 @@ def workflow_init(target_repo: str, goal: str, run_id: str | None = None) -> dic
     goal:        the user's natural-language goal for this run.
     run_id:      optional caller-supplied run id (else generated).
     """
-    ctx = bootstrap.load_run_context()
+    ctx = bootstrap.build_run_context()
     if ctx is None:
         raise _EngineCallError("no run context configured (AGENTFLOW_RUN_CONTEXT unset)")
     eng = bootstrap.build_engine_for_init(ctx, target_repo=target_repo, run_id=run_id)
@@ -253,7 +261,7 @@ def get_engine():
     Builds the Engine from the active-run pointer + the run context
     (``AGENTFLOW_RUN_CONTEXT``). Returns None when there is no active run or no
     run context configured (used by tests that only exercise workflow_status)."""
-    ctx = bootstrap.load_run_context()
+    ctx = bootstrap.build_run_context()
     if ctx is None:
         return None
     try:

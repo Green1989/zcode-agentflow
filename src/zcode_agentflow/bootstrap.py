@@ -29,14 +29,31 @@ from pathlib import Path
 
 from zcode_agentflow import active_run, store
 
-__all__ = ["RecoveryNeedsHuman", "RunPaths", "resume_active_run", "build_engine",
-           "RunContext", "load_run_context"]
+__all__ = [
+    "RecoveryNeedsHuman",
+    "RunPaths",
+    "resume_active_run",
+    "build_engine",
+    "RunContext",
+    "load_run_context",
+    "ContextResolutionError",
+    "process_config",
+    "build_run_context",
+]
 
 
 class RecoveryNeedsHuman(RuntimeError):
     """Raised by :func:`resume_active_run` when the pointer's run state is
     corrupt and cannot be rebuilt from events. Surfaced so a human decides —
     never silently picks another run (P0-1)."""
+
+
+class ContextResolutionError(RuntimeError):
+    """Raised when the production run context cannot be resolved (e.g. the
+    plugin root env var is unset, or the config/capabilities cannot be loaded
+    or fail the capability gate). Surfaced so a misconfigured production launch
+    fails loud (G6) rather than silently producing a context that makes every
+    MCP tool raise a confusing 'no run context' error downstream."""
 
 
 @dataclass(frozen=True)
@@ -145,6 +162,147 @@ def load_run_context() -> RunContext | None:
         effective_config=d.get("effective_config", {}),
         adapters=adapters,
     )
+
+
+# ===========================================================================
+# Production run-context resolution (audit-fix 2026-07-31; Plan errata 9–10)
+# ===========================================================================
+#
+# The v2.2 plan body left the production source of `user_data_root` /
+# `plugin_root` / config / `effective_config` unspecified: Task 3.8 declares
+# `resume_active_run(user_data_root)` and Task 6.7 declares `get_engine()`, but
+# neither names where the top-level caller obtains them. Phase 1–6 therefore
+# shipped with `load_run_context` (AGENTFLOW_RUN_CONTEXT) as the ONLY path —
+# which its own docstring above admits is "the test/subprocess path", and which
+# the production plugin manifest does NOT set. In a real ZCode launch every
+# state-changing MCP tool thus raised `no run context configured`.
+#
+# `process_config` (below) is the production path. `build_run_context` is the
+# sole dispatcher: AGENTFLOW_RUN_CONTEXT set -> test path (unchanged); else ->
+# production path. server.py and the hooks call `build_run_context`, never
+# `load_run_context` directly.
+
+
+# env var names (kept as module constants so the manifest + tests stay in sync).
+ENV_PLUGIN_ROOT = "ZCODE_PLUGIN_ROOT"
+ENV_PLUGIN_ROOT_FALLBACK = "CLAUDE_PLUGIN_ROOT"
+ENV_USER_DATA_ROOT = "AGENTFLOW_USER_DATA_ROOT"
+ENV_CONFIG_PATH = "AGENTFLOW_CONFIG"
+ENV_CAPABILITIES_PATH = "AGENTFLOW_CAPABILITIES"
+ENV_RUN_CONTEXT = "AGENTFLOW_RUN_CONTEXT"
+
+# default user_data_root: a per-user, cross-project run-data home OUTSIDE the
+# repo (Spec §2.2). Sibling of plugin_root so a single tree is easy to back up.
+DEFAULT_USER_DATA_DIRNAME = "agentflow-data"
+
+
+def _resolve_plugin_root_env() -> Path | None:
+    """Return the plugin root from the spike-confirmed env vars
+    (``ZCODE_PLUGIN_ROOT`` / ``CLAUDE_PLUGIN_ROOT``), or None when neither is
+    set. These are expanded by the ZCode host for plugin MCP servers / hooks
+    (docs/capabilities.json manifest_fields.plugin_manifest + template_vars)."""
+    val = os.environ.get(ENV_PLUGIN_ROOT) or os.environ.get(ENV_PLUGIN_ROOT_FALLBACK)
+    return Path(val) if val else None
+
+
+def process_config() -> RunContext:
+    """Resolve the production :class:`RunContext` from the environment (Plan
+    erratum 9–10). This is the production counterpart to the test-only
+    :func:`load_run_context`.
+
+    Sources (all read here, none guessed):
+      * ``plugin_root``  — ``ZCODE_PLUGIN_ROOT`` (fallback ``CLAUDE_PLUGIN_ROOT``).
+      * ``user_data_root`` — ``AGENTFLOW_USER_DATA_ROOT``; default
+        ``<plugin_root>/../agentflow-data`` (a per-user run-data home outside the
+        repo). The directory is created if missing (it is the run-data HOME, not
+        per-run durable state — out of Store scope; Appendix A marks bootstrap
+        "Mutates durable state? no").
+      * ``config``       — ``AGENTFLOW_CONFIG`` loaded via :func:`config.load`
+        (strict schema: unknown keys / wrong types rejected).
+      * ``effective_config`` — ``AGENTFLOW_CAPABILITIES`` (gates) run through
+        :func:`config.validate_capabilities`.
+
+    The capability gate is G6 fail-loud: if ``tool_confirmation=false`` and the
+    config does not allow the non-adversarial fallback, ``validate_capabilities``
+    raises :class:`CapabilityError` (propagated as the launch error). Tests that
+    exercise only the *resolution* path supply a config with the fallback switch
+    set true so the gate does not reject before they can assert.
+    """
+    from zcode_agentflow import config as config_mod
+
+    plugin_root = _resolve_plugin_root_env()
+    if plugin_root is None:
+        raise ContextResolutionError(
+            "cannot resolve production run context: neither "
+            f"{ENV_PLUGIN_ROOT} nor {ENV_PLUGIN_ROOT_FALLBACK} is set. The plugin "
+            "manifest must set ZCODE_PLUGIN_ROOT (expanded by the ZCode host for "
+            "plugin MCP servers / hooks)."
+        )
+
+    user_data = os.environ.get(ENV_USER_DATA_ROOT)
+    if user_data:
+        user_data_root = Path(user_data)
+    else:
+        user_data_root = plugin_root.resolve().parent / DEFAULT_USER_DATA_DIRNAME
+    user_data_root.mkdir(parents=True, exist_ok=True)
+
+    cfg_path = os.environ.get(ENV_CONFIG_PATH, "config.yaml")
+    cap_path = os.environ.get(ENV_CAPABILITIES_PATH)
+    try:
+        cfg = config_mod.load(cfg_path)
+    except FileNotFoundError as exc:
+        raise ContextResolutionError(
+            f"cannot resolve production run context: AGENTFLOW_CONFIG file not "
+            f"found: {cfg_path!r}"
+        ) from exc
+    except config_mod.ConfigError as exc:
+        raise ContextResolutionError(
+            f"cannot resolve production run context: config {cfg_path!r} failed "
+            f"validation: {exc}"
+        ) from exc
+
+    findings = None
+    if cap_path:
+        try:
+            findings = json.loads(Path(cap_path).read_text(encoding="utf-8"))["gates"]
+        except (FileNotFoundError, KeyError, ValueError) as exc:
+            raise ContextResolutionError(
+                f"cannot resolve production run context: AGENTFLOW_CAPABILITIES "
+                f"could not be read from {cap_path!r}: {exc}"
+            ) from exc
+
+    if findings is not None:
+        effective = config_mod.validate_capabilities(cfg, findings)
+    else:
+        # No capabilities file provided: use validate_capabilities' absent-gate
+        # defaults (effective_approval_mode=prefer_zcode_tool_confirmation,
+        # effective_reasoning_effort=high). The startup gate in server.py still
+        # runs separately when AGENTFLOW_CAPABILITIES is set.
+        effective = config_mod.validate_capabilities(cfg, {})
+
+    return RunContext(
+        plugin_root=plugin_root,
+        user_data_root=user_data_root,
+        config=cfg,
+        effective_config=effective,
+        adapters=None,
+    )
+
+
+def build_run_context() -> RunContext | None:
+    """The SOLE run-context dispatcher (Plan erratum 9).
+
+    ``AGENTFLOW_RUN_CONTEXT`` set (test/subprocess path) -> :func:`load_run_context`
+    (unchanged). Otherwise -> :func:`process_config` (production path).
+
+    server.py and the hooks call THIS function; they never call ``load_run_context``
+    or ``process_config`` directly, so the test-vs-production choice lives in one
+    place. Raises :class:`ContextResolutionError` when production env is missing
+    the plugin root (fail-loud; never a silent None that would surface later as a
+    confusing 'no run context' tool error)."""
+    if os.environ.get(ENV_RUN_CONTEXT):
+        return load_run_context()
+    return process_config()
 
 
 def build_engine_for_active_run(ctx: RunContext):
