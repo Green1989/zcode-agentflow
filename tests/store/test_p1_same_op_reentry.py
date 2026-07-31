@@ -80,6 +80,58 @@ def test_different_operation_id_while_active_is_rejected(tmp_path: Path):
         )
 
 
+def test_same_operation_id_active_reentry_is_idempotent(tmp_path: Path):
+    """Plan Task 3.4: while opA is mid-external (active_operation_id == opA),
+    re-beginning the SAME operation_id is the idempotent re-entry path and MUST
+    proceed — not be rejected by ALLOWED_FROM because the run is now in the
+    intermediate state. The transition already passed its source-state check on
+    the FIRST begin; the re-entry is the Engine retrying the same in-flight op
+    (e.g. after losing the original lease). It must:
+
+      - succeed (return a BeginResult for the same op);
+      - issue a FRESH lease_token (the old one is voided);
+      - NOT advance the state/revision again (the op is already in flight).
+
+    A DIFFERENT id is still hard-rejected (covered above). This is the case the
+    Plan names: 'only (a) the same operation_id (idempotent re-entry) ... may
+    proceed'.
+    """
+    control = tmp_path / "control"
+    control.mkdir()
+    _seed(control)
+    s = store.Store(control)
+    op_id = "run__planner_draft_spec__r1__a1"
+
+    br1 = s.begin_operation(
+        operation_id=op_id,
+        request={"tool": "planner_draft_spec", "args": {}},
+        tool="planner_draft_spec",
+        expected_revision=store.State.load(control).revision,
+        intermediate_state="DRAFTING_SPEC",
+        replay_policy="COSTFUL_READ",
+    )
+    rev_after_first = store.State.load(control).revision
+
+    # Same id, re-entered while ACTIVE — must succeed (the Plan's idempotent
+    # re-entry path), not raise TransitionNotAllowed.
+    br2 = s.begin_operation(
+        operation_id=op_id,
+        request={"tool": "planner_draft_spec", "args": {}},
+        tool="planner_draft_spec",
+        expected_revision=rev_after_first,
+        intermediate_state="DRAFTING_SPEC",
+        replay_policy="COSTFUL_READ",
+    )
+    assert br2.operation_id == op_id
+    # a FRESH lease (the old one is voided by the re-entry)
+    assert br2.lease_token != br1.lease_token
+    # the re-entry did NOT double-advance the state/revision
+    st = store.State.load(control)
+    assert st.state == "DRAFTING_SPEC"
+    assert st.revision == rev_after_first
+    assert st.active_operation_id == op_id
+
+
 def test_same_operation_id_reentry_after_midexternal_crash_current_behavior(
     tmp_path: Path,
 ):

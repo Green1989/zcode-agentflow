@@ -506,6 +506,32 @@ class Store:
                     f"{operation_id!r}"
                 )
 
+            # IDEMPOTENT RE-ENTRY (Plan Task 3.4: 'only (a) the same operation_id
+            # (idempotent re-entry) ... may proceed'). If THIS operation is
+            # already the active one, the Engine is retrying the same in-flight
+            # op (e.g. after losing the original lease). The source-state check
+            # already passed on the FIRST begin, so we SKIP ALLOWED_FROM here
+            # (the run is now in the intermediate state, which is intentionally
+            # not in any tool's ALLOWED_FROM set). We re-issue a FRESH lease and
+            # return a BeginResult WITHOUT re-advancing state/revision.
+            if state.active_operation_id == operation_id:
+                if expected_revision != state.revision:
+                    raise CasMismatch(
+                        f"re-entry expected_revision {expected_revision} != "
+                        f"current {state.revision} (run {state.run_id!r})"
+                    )
+                op = OperationManager(self.control_root).open_existing(operation_id)
+                lease_token = secrets.token_urlsafe(32)
+                state.active_operation_lease = self._hash_lease(lease_token)
+                state.save(self.control_root)
+                return BeginResult(
+                    operation_id=operation_id,
+                    lease_token=lease_token,
+                    revision_after_begin=state.revision,
+                    staging_dir=op.dir,
+                    state_snapshot=state.to_dict(),
+                )
+
             # ALLOWED_FROM: tool may run from the current state.
             allowed = ALLOWED_FROM.get(tool)
             if allowed is None:
