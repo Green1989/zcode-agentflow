@@ -35,6 +35,7 @@ from pathlib import Path
 
 import pytest
 
+from zcode_agentflow import canonical
 from zcode_agentflow import locks, store
 
 
@@ -236,6 +237,61 @@ def test_finish_uses_revision_after_begin_as_cas(fresh_store):
     assert after.active_operation_id is None  # cleared on commit
     # the operation record is COMMITTED
     assert store.OperationManager(control).open_existing("opA").status == "COMMITTED"
+
+
+def test_finish_commits_authoritative_state_updates_with_transition(fresh_store):
+    s, control, _ = fresh_store
+    br = _begin_ok(s)
+
+    s.finish_operation(
+        operation_id="opA", lease_token=br.lease_token,
+        expected_revision=br.revision_after_begin,
+        next_state="READY_FOR_SPEC_APPROVAL", staged_artifacts={}, result={},
+        state_updates={"current_task": "T001", "task_start_commit": "abc"},
+    )
+
+    after = store.State.load(control)
+    assert after.current_task == "T001"
+    assert after.task_start_commit == "abc"
+    finish_event = store.EventLog(control).latest()
+    snapshot = control / finish_event["state_after_path"]
+    assert canonical.hash_file(snapshot) == finish_event["state_after_sha256"]
+    assert __import__("json").loads(snapshot.read_bytes())["current_task"] == "T001"
+
+
+def test_finish_rejects_unknown_state_updates(fresh_store):
+    s, control, _ = fresh_store
+    br = _begin_ok(s)
+
+    with pytest.raises(ValueError, match="state update"):
+        s.finish_operation(
+            operation_id="opA", lease_token=br.lease_token,
+            expected_revision=br.revision_after_begin,
+            next_state="READY_FOR_SPEC_APPROVAL", staged_artifacts={}, result={},
+            state_updates={"state": "READY_TO_MERGE"},
+        )
+
+    assert store.State.load(control).active_operation_id == "opA"
+
+
+def test_finish_stages_control_file_and_cleans_it_if_commit_fails(fresh_store, monkeypatch):
+    s, control, _ = fresh_store
+    br = _begin_ok(s)
+    rel = "approvals/apr_test.json"
+    path = control / rel
+    payload = canonical.canonical_json_bytes({"approval_id": "apr_test"})
+    monkeypatch.setenv("AGENTFLOW_CRASH_AFTER", "finish_after_snapshot")
+
+    with pytest.raises(store.CrashInjected):
+        s.finish_operation(
+            operation_id="opA", lease_token=br.lease_token,
+            expected_revision=br.revision_after_begin,
+            next_state="READY_FOR_SPEC_APPROVAL", staged_artifacts={}, result={},
+            staged_control_files={rel: payload},
+        )
+
+    assert not path.exists()
+    assert store.State.load(control).active_operation_id == "opA"
 
 
 def test_finish_rejects_wrong_lease_token(fresh_store):

@@ -186,6 +186,78 @@ def test_approve_fails_loud_without_confirmation(tmp_path, control_root):
         eng.workflow_approve_spec(expected_revision=st.revision)
 
 
+def test_approve_prefer_intent_does_not_count_as_strong_confirmation(control_root):
+    """The config preference is not proof that ZCode confirmation is configured."""
+    _seed_ready_for_approval(control_root)
+    eng = _engine(
+        control_root,
+        effective_approval_mode="prefer_zcode_tool_confirmation",
+        config={"human_gates": {"spec_approval": {
+            "allow_non_adversarial_fallback": False,
+        }}},
+    )
+    st = store.State.load(control_root)
+
+    with pytest.raises(approval.ApprovalUnavailableError):
+        eng.workflow_approve_spec(expected_revision=st.revision)
+
+    assert store.State.load(control_root).state == "NEEDS_HUMAN"
+
+
+def test_approve_prefer_intent_uses_explicit_fallback_when_allowed(control_root):
+    _seed_ready_for_approval(control_root)
+    eng = _engine(
+        control_root,
+        effective_approval_mode="prefer_zcode_tool_confirmation",
+        config={"human_gates": {"spec_approval": {
+            "allow_non_adversarial_fallback": True,
+        }}},
+    )
+    st = store.State.load(control_root)
+
+    eng.workflow_approve_spec(expected_revision=st.revision)
+
+    rec = json.loads(next((Path(control_root) / "approvals").glob("apr_*.json"))
+                         .read_text(encoding="utf-8"))
+    assert rec["approval_method"] == "non_adversarial_convention"
+    assert rec["security_warning"]
+
+
+def test_approve_prefer_intent_becomes_strong_only_when_configured(control_root):
+    _seed_ready_for_approval(control_root)
+    eng = _engine(
+        control_root,
+        effective_approval_mode="prefer_zcode_tool_confirmation",
+        config={"human_gates": {"spec_approval": {
+            "allow_non_adversarial_fallback": False,
+        }}},
+    )
+    eng.effective_config["confirmation_configured"] = True
+    st = store.State.load(control_root)
+
+    eng.workflow_approve_spec(expected_revision=st.revision)
+
+    rec = json.loads(next((Path(control_root) / "approvals").glob("apr_*.json"))
+                         .read_text(encoding="utf-8"))
+    assert rec["approval_method"] == "zcode_tool_confirmation"
+
+
+def test_approve_does_not_leave_record_when_finish_fails_before_commit(
+    control_root, monkeypatch
+):
+    _seed_ready_for_approval(control_root)
+    eng = _engine(control_root)
+    monkeypatch.setenv("AGENTFLOW_CRASH_AFTER", "finish_after_snapshot")
+    st = store.State.load(control_root)
+
+    with pytest.raises(store.CrashInjected):
+        eng.workflow_approve_spec(expected_revision=st.revision)
+
+    approvals_dir = Path(control_root) / "approvals"
+    assert not approvals_dir.exists() or not any(approvals_dir.iterdir())
+    assert store.State.load(control_root).state == "NEEDS_HUMAN"
+
+
 # ---------- 2. create_plan requires the approved spec sha --------------------
 
 

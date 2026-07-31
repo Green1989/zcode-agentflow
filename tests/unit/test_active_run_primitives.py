@@ -85,6 +85,23 @@ def test_clear_pointer_removes_file(tmp_path: Path):
         assert reg.read_pointer_locked() is None
 
 
+def test_mark_terminal_rejects_a_different_run_id(tmp_path: Path):
+    user_data = tmp_path / "user_data"
+    user_data.mkdir()
+    with active_run.ActiveRunRegistry.locked(user_data) as reg:
+        reg.set_pointer_locked(
+            run_id="run-a", control_root=tmp_path / "c", target_repo_root=tmp_path / "t"
+        )
+
+    with active_run.ActiveRunRegistry.locked(user_data) as reg:
+        with pytest.raises(RuntimeError, match="different run_id"):
+            reg.mark_terminal_locked("run-b")
+
+    pointer = active_run.read_pointer(user_data)
+    assert pointer["run_id"] == "run-a"
+    assert pointer.get("terminal") is not True
+
+
 # ---------- Registry Lock serialization (P0-4) -------------------------------
 
 

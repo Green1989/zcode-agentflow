@@ -172,6 +172,49 @@ def test_dependency_change_authorized_allowed(tmp_path: Path):
     assert res["needs_human"] is False
 
 
+def test_dependency_rename_checks_old_and_new_paths(tmp_path: Path):
+    """A rename's old path is still relevant for dependency classification."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    (repo / "requirements.txt").write_text("pytest\n", encoding="utf-8")
+    base = _commit(repo, "init")
+    _git("mv", "requirements.txt", "requirements-prod.txt", cwd=repo)
+    head = _commit(repo, "rename dependency manifest")
+
+    res = policy_change.audit(
+        worktree=repo, base_commit=base, head_commit=head,
+        declared_files=["requirements-prod.txt"],
+        planned_changes=_planned(may_add_dependencies=True),
+        config=_base_config(),
+    )
+
+    assert res["dependency_files_changed"] is True
+    assert res["needs_human"] is False
+
+
+def test_authorized_dependency_file_still_cannot_bypass_undeclared_check(tmp_path: Path):
+    """Dependency classification and scope classification are independent."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    (repo / "app.py").write_text("print('hi')\n", encoding="utf-8")
+    base = _commit(repo, "init")
+    (repo / "package.json").write_text('{"name":"x"}\n', encoding="utf-8")
+    head = _commit(repo, "add dependency manifest")
+
+    res = policy_change.audit(
+        worktree=repo, base_commit=base, head_commit=head,
+        declared_files=[],
+        planned_changes=_planned(may_add_dependencies=True),
+        config=_base_config(change_policy={"dependency_file_patterns": ["package.json"]}),
+    )
+
+    assert res["dependency_files_changed"] is True
+    assert res["undeclared_files_changed"] == ["package.json"]
+    assert res["needs_human"] is True
+
+
 # ===========================================================================
 # undeclared file
 # ===========================================================================
@@ -296,6 +339,29 @@ def test_irreversible_migration_always_needs_human(tmp_path: Path):
     assert res["irreversible_migration"] is True
     assert res["needs_human"] is True
     assert any("irreversible" in r.lower() for r in res["reasons"])
+
+
+def test_rename_checks_old_path_for_irreversible_pattern(tmp_path: Path):
+    """Renaming an irreversible migration cannot hide its old path."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    (repo / "drop.sql").write_text("DROP TABLE users;\n", encoding="utf-8")
+    base = _commit(repo, "init")
+    _git("mv", "drop.sql", "drop-users.sql", cwd=repo)
+    head = _commit(repo, "rename irreversible migration")
+
+    res = policy_change.audit(
+        worktree=repo, base_commit=base, head_commit=head,
+        declared_files=["drop-users.sql"],
+        planned_changes=_planned(),
+        config=_base_config(change_policy={
+            "irreversible_migration_patterns": ["drop.sql"],
+        }),
+    )
+
+    assert res["irreversible_migration"] is True
+    assert res["needs_human"] is True
 
 
 # ===========================================================================

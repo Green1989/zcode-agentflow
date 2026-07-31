@@ -69,6 +69,31 @@ def test_invalid_type_rejected(tmp_path):
         config_mod.load(p)
 
 
+def test_change_policy_pattern_lists_are_supported_by_strict_schema(tmp_path):
+    obj = _prod_yaml()
+    obj["change_policy"]["dependency_file_patterns"] = ["custom.lock"]
+    obj["change_policy"]["migration_file_patterns"] = ["db/changes/**"]
+    obj["change_policy"]["irreversible_migration_patterns"] = ["db/changes/drop_*.sql"]
+    p = _write(tmp_path, obj)
+
+    cfg = config_mod.load(p)
+
+    assert cfg["change_policy"]["dependency_file_patterns"] == ["custom.lock"]
+    assert cfg["change_policy"]["migration_file_patterns"] == ["db/changes/**"]
+    assert cfg["change_policy"]["irreversible_migration_patterns"] == [
+        "db/changes/drop_*.sql"
+    ]
+
+
+def test_change_policy_pattern_lists_reject_non_arrays(tmp_path):
+    obj = _prod_yaml()
+    obj["change_policy"]["dependency_file_patterns"] = "custom.lock"
+    p = _write(tmp_path, obj)
+
+    with pytest.raises(Exception):
+        config_mod.load(p)
+
+
 def test_network_policy_is_advisory_or_absent(tmp_path):
     """Review §六.3: no fake `network: deny` pretending to enforce isolation.
     If a network policy field is present it must be the honest

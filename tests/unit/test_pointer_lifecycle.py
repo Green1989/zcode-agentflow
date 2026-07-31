@@ -245,6 +245,52 @@ def test_ready_to_merge_marks_pointer_terminal_not_cleared(tmp_path):
         os.environ.pop("AGENTFLOW_RUN_CONTEXT", None)
 
 
+def test_pointer_handoff_failure_does_not_fail_already_committed_terminal_run(
+    tmp_path, monkeypatch
+):
+    """A pointer race after finish must not call fail_operation on a cleared lease."""
+    repo = _make_repo(tmp_path)
+    eng, user_data, control, wt = _engine_for_init(tmp_path, repo)
+    eng.workflow_init(target_repo=str(repo), goal="g", run_id=RUN_ID)
+    env = {"PATH": os.environ.get("PATH", "")}
+    (wt / "src").mkdir(exist_ok=True)
+    (wt / "src" / "x.py").write_text("x\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=wt, check=True, env=env)
+    subprocess.run(["git", "commit", "-q", "-m", "t"], cwd=wt, check=True, env=env)
+    head = gitops.head(wt)
+    base = store.State.load(control).base_commit
+    st = _seed_reviewing_for_complete(tmp_path, control, wt, repo, head, base)
+
+    eng2 = engine.Engine(
+        store.Store(control),
+        roots={
+            "plugin_root": str(_plugin(tmp_path)),
+            "target_repo_root": str(repo),
+            "run_worktree_root": str(wt),
+            "control_root": str(control),
+        },
+        user_data_root=user_data,
+        config={"verification": {"program_allowlist": [sys.executable],
+                                  "interpreter_allowlist": ["bash", "cmd.exe"]}},
+        effective_config={"effective_approval_mode": "zcode_tool_confirmation"},
+    )
+
+    def pointer_race(self, run_id):
+        raise RuntimeError("pointer changed before terminal mark")
+
+    monkeypatch.setattr(active_run.ActiveRunRegistry, "mark_terminal_locked", pointer_race)
+
+    with pytest.raises(RuntimeError, match="pointer changed"):
+        eng2.workflow_complete_task(task_id="T001", expected_revision=st.revision)
+
+    after = store.State.load(control)
+    assert after.state == "READY_TO_MERGE"
+    assert after.active_operation_id is None
+    op_id = next(p.name for p in (control / store.OPS_DIRNAME).iterdir()
+                 if "workflow_complete_task" in p.name)
+    assert store.OperationManager(control).open_existing(op_id).status == "COMMITTED"
+
+
 # ---------- 4. terminal pointer allows a new run ----------------------------
 
 

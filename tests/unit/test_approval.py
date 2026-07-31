@@ -246,4 +246,3 @@ def test_intent_string_is_distinct_from_record_method():
     strings — documenting that config output cannot be fed verbatim to
     record_approval."""
     assert "prefer_zcode_tool_confirmation" != "zcode_tool_confirmation"
-

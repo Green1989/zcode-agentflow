@@ -171,6 +171,18 @@ CONFIG_SCHEMA = {
                 "on_unauthorized_migration": {"type": "string"},
                 "on_undeclared_file": {"type": "string"},
                 "irreversible_migration": {"type": "string"},
+                "dependency_file_patterns": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1},
+                },
+                "migration_file_patterns": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1},
+                },
+                "irreversible_migration_patterns": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1},
+                },
             },
         },
         "review": {

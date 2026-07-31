@@ -99,7 +99,12 @@ class ActiveRunRegistry:
         ptr = self.read_pointer_locked()
         if ptr is None:
             raise RuntimeError("cannot mark terminal: no active-run pointer exists")
-        ptr["run_id"] = str(run_id)
+        expected_run_id = str(run_id)
+        if ptr.get("run_id") != expected_run_id:
+            raise RuntimeError(
+                f"cannot mark terminal: pointer names run_id {ptr.get('run_id')!r}, "
+                f"different run_id {expected_run_id!r} was supplied"
+            )
         ptr["state"] = "READY_TO_MERGE"
         ptr["terminal"] = True
         ptr["updated_at"] = _utc_now_iso()

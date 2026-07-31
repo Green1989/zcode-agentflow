@@ -27,7 +27,7 @@ import os
 import secrets
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from zcode_agentflow import canonical
 
@@ -434,6 +434,19 @@ ALLOWED_FROM: dict[str, frozenset[str]] = {
     "workflow_complete_task": frozenset({"REVIEWING_TASK"}),
 }
 
+# Fields that a completed operation may atomically update in addition to the
+# state-machine transition and artifact pointers. Structural/lease fields stay
+# Store-owned so callers cannot smuggle a second transition through finish.
+FINISH_STATE_UPDATE_FIELDS = frozenset({
+    "current_task",
+    "completed_tasks",
+    "task_start_commit",
+    "last_reviewed_commit",
+    "verified_head_commit",
+    "review_round",
+    "repair_round",
+})
+
 
 @dataclass
 class BeginResult:
@@ -466,6 +479,31 @@ class Store:
         self.control_root.mkdir(parents=True, exist_ok=True)
         self._last_recover_outcome: str | None = None
 
+    def _fail_begin_locked(
+        self, *, state: State, op: Operation, operation_id: str,
+        from_state: str, reason: str,
+    ) -> None:
+        """Fail a begin validator while the begin Run Lock is still held."""
+        state.previous_state = from_state
+        state.state = "NEEDS_HUMAN"
+        state.revision = state.revision + 1
+        state.active_operation_id = None
+        state.active_operation_lease = None
+        snap_rel, snap_sha = op.write_state_snapshot(
+            "state_after_fail", state.to_dict()
+        )
+        EventLog(self.control_root).append(
+            operation_id=operation_id,
+            from_state=from_state,
+            to_state="NEEDS_HUMAN",
+            reason=f"fail:{reason}",
+            state_after_path=snap_rel,
+            state_after_sha=snap_sha,
+            revision=state.revision,
+        )
+        state.save(self.control_root)
+        op.mark_failed()
+
     # ---- read helpers (no lock; state.json is atomic on disk) ------------
 
     def load_state(self) -> State:
@@ -482,11 +520,16 @@ class Store:
     # ---- BEGIN (short lock) ----------------------------------------------
 
     def begin_operation(self, *, operation_id, request, tool, expected_revision,
-                        intermediate_state, replay_policy) -> BeginResult:
+                        intermediate_state, replay_policy,
+                        begin_validator=None) -> BeginResult:
         """Take the per-Run lock, verify the hard gate + ALLOWED_FROM + CAS,
         advance to the intermediate state with revision+1, write a recoverable
         begin event + state_after snapshot, set active_operation_id + lease,
-        and return a :class:`BeginResult`. RELEASES the lock before returning.
+        and return a :class:`BeginResult`. ``begin_validator``, when supplied,
+        receives the in-memory state after the intermediate transition has been
+        prepared and runs under this same lock. A validator failure is routed to
+        NEEDS_HUMAN before the lock is released. RELEASES the lock before
+        returning.
 
         HARD GATE (parallel P0-2): if ``state.active_operation_id`` is set AND
         differs from ``operation_id`` -> raise :class:`ActiveOperationInProgress`.
@@ -530,6 +573,16 @@ class Store:
                     request=request,
                     replay_policy=replay_policy,
                 )
+                if begin_validator is not None:
+                    try:
+                        begin_validator(state)
+                    except BaseException:
+                        self._fail_begin_locked(
+                            state=state, op=op, operation_id=operation_id,
+                            from_state=state.state,
+                            reason="begin validator failed",
+                        )
+                        raise
                 lease_token = secrets.token_urlsafe(32)
                 state.active_operation_lease = self._hash_lease(lease_token)
                 state.save(self.control_root)
@@ -576,6 +629,17 @@ class Store:
             state.active_operation_id = operation_id
             state.active_operation_lease = self._hash_lease(lease_token)
 
+            if begin_validator is not None:
+                try:
+                    begin_validator(state)
+                except BaseException:
+                    self._fail_begin_locked(
+                        state=state, op=op, operation_id=operation_id,
+                        from_state=pre_begin_state,
+                        reason="begin validator failed",
+                    )
+                    raise
+
             # Write a recoverable state_after snapshot for the begin transition
             # (so a crash mid-external can reconstruct the intermediate state —
             # parallel P0-2: begin writes events, not only finish). Each event
@@ -621,11 +685,72 @@ class Store:
                 f"lease token does not match the active operation {operation_id!r}"
             )
 
+    def _control_file_path(self, relative_path) -> Path:
+        """Resolve a staged control file without permitting root escape."""
+        raw = str(relative_path).replace("\\", "/")
+        rel = PurePosixPath(raw)
+        if (
+            not raw
+            or rel.is_absolute()
+            or any(part in ("", ".", "..") for part in rel.parts)
+        ):
+            raise ValueError(f"invalid staged control-file path: {relative_path!r}")
+        if rel.as_posix() in {STATE_FILENAME, EVENTS_FILENAME} or rel.parts[0] == OPS_DIRNAME:
+            raise ValueError(
+                f"staged control files cannot replace Store-owned path {relative_path!r}"
+            )
+        root = self.control_root.resolve()
+        target = (root / Path(*rel.parts)).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(
+                f"staged control-file path escapes control_root: {relative_path!r}"
+            ) from exc
+        return target
+
+    def _stage_control_files(self, staged_control_files: dict | None) -> list[tuple[Path, bytes | None]]:
+        """Write staged control files and return backups for rollback."""
+        if not staged_control_files:
+            return []
+        prepared: list[tuple[Path, bytes]] = []
+        for relative_path, data in staged_control_files.items():
+            target = self._control_file_path(relative_path)
+            if target.exists() and not target.is_file():
+                raise ValueError(f"staged control-file target is not a file: {relative_path!r}")
+            if not isinstance(data, (bytes, bytearray)):
+                raise TypeError(
+                    f"staged control-file data must be bytes: {relative_path!r}"
+                )
+            prepared.append((target, bytes(data)))
+
+        backups: list[tuple[Path, bytes | None]] = []
+        try:
+            for target, data in prepared:
+                old = target.read_bytes() if target.exists() else None
+                target.parent.mkdir(parents=True, exist_ok=True)
+                canonical.write_canonical_text(target, data)
+                backups.append((target, old))
+        except BaseException:
+            self._restore_control_files(backups)
+            raise
+        return backups
+
+    @staticmethod
+    def _restore_control_files(backups: list[tuple[Path, bytes | None]]) -> None:
+        for target, old in reversed(backups):
+            if old is None:
+                if target.exists():
+                    target.unlink()
+            else:
+                target.write_bytes(old)
+
     # ---- FINISH (short lock; SOLE committer of state.json, errata #6) ----
 
     def finish_operation(self, *, operation_id, lease_token, expected_revision,
                          next_state, staged_artifacts, result,
-                         base_commit=None) -> dict:
+                         base_commit=None, state_updates=None,
+                         staged_control_files=None) -> dict:
         """Re-take the per-Run lock, verify op + lease + revision_after_begin,
         write the result + the next state_after snapshot, append+fsync the
         finish event, and THEN perform the SINGLE ``os.replace(state.json)``
@@ -642,6 +767,12 @@ class Store:
         new generation manifest and FILLS ``state.artifact_generation`` /
         per-artifact shas WITHOUT touching state.json — the single
         ``os.replace(state.json)`` below remains the only commit point (errata #6).
+
+        ``state_updates`` contains the small whitelist of authoritative fields
+        that must be committed with this transition. ``staged_control_files``
+        contains canonical UTF-8 control files (for example an approval record)
+        that are rolled back if the finish event/state commit fails before the
+        state replace.
         """
         from zcode_agentflow import locks as _locks
 
@@ -657,6 +788,14 @@ class Store:
 
             op = OperationManager(self.control_root).open_existing(operation_id)
 
+            state_updates = dict(state_updates or {})
+            unknown_updates = set(state_updates) - FINISH_STATE_UPDATE_FIELDS
+            if unknown_updates:
+                raise ValueError(
+                    "unknown state update field(s): "
+                    + ", ".join(sorted(unknown_updates))
+                )
+
             # advance to next_state with revision+1; clear the active op + lease.
             pre_state = state.state
             state.previous_state = pre_state
@@ -670,6 +809,12 @@ class Store:
             # save that a crash could skip. Only set when provided.
             if base_commit is not None:
                 state.base_commit = base_commit
+            for field_name, value in state_updates.items():
+                setattr(
+                    state,
+                    field_name,
+                    list(value) if field_name == "completed_tasks" else value,
+                )
 
             # persist the adapter result (if any) + the new state_after snapshot.
             if result is not None:
@@ -692,31 +837,45 @@ class Store:
                     crash_after="finish_after_blobs",
                     crash_after_manifest="finish_after_manifest",
                 )
-            snap_rel, snap_sha = op.write_state_snapshot(
-                "state_after_finish", state.to_dict()
-            )
-            _crash_checkpoint("finish_after_snapshot")
-            # Commit protocol (Spec §3.5 写入顺序 + Plan Task 3.4 pseudocode):
-            # the recoverable FINISH event (with its sha-verified state_after
-            # snapshot) is appended+fsync'd BEFORE the single state.json
-            # replace. Reversing this leaves a crash window where state.json is
-            # advanced but only the BEGIN event is durable; a later state.json
-            # corruption then loses the committed transition + artifact pointer
-            # (P0-1, reviewer window).
-            EventLog(self.control_root).append(
-                operation_id=operation_id,
-                from_state=pre_state,
-                to_state=next_state,
-                reason=f"finish:{operation_id.split('__')[1] if '__' in operation_id else operation_id}",
-                state_after_path=snap_rel,
-                state_after_sha=snap_sha,
-                revision=state.revision,
-            )
-            _crash_checkpoint("finish_after_event")
-            # THE ONLY COMMIT POINT: single os.replace(state.json). The event
-            # above is already durable, so a crash here (or a later state.json
-            # corruption) can still reconstruct the committed state from it.
-            state.save(self.control_root)
+            # Control files are staged only after result/artifact preparation;
+            # if anything below fails, no approval/control file can outlive the
+            # uncommitted state transition.
+            control_backups = self._stage_control_files(staged_control_files)
+            state_committed = False
+            event_appended = False
+            try:
+                snap_rel, snap_sha = op.write_state_snapshot(
+                    "state_after_finish", state.to_dict()
+                )
+                _crash_checkpoint("finish_after_snapshot")
+                # Commit protocol (Spec §3.5 写入顺序 + Plan Task 3.4 pseudocode):
+                # the recoverable FINISH event (with its sha-verified state_after
+                # snapshot) is appended+fsync'd BEFORE the single state.json
+                # replace. Reversing this leaves a crash window where state.json
+                # is advanced but only the BEGIN event is durable; a later state
+                # corruption then loses the committed transition + artifact pointer.
+                EventLog(self.control_root).append(
+                    operation_id=operation_id,
+                    from_state=pre_state,
+                    to_state=next_state,
+                    reason=f"finish:{operation_id.split('__')[1] if '__' in operation_id else operation_id}",
+                    state_after_path=snap_rel,
+                    state_after_sha=snap_sha,
+                    revision=state.revision,
+                )
+                event_appended = True
+                _crash_checkpoint("finish_after_event")
+                # THE ONLY COMMIT POINT: single os.replace(state.json).
+                state.save(self.control_root)
+                state_committed = True
+            except BaseException:
+                # Once the durable FINISH event exists, recovery will roll the
+                # state forward from its snapshot if state.json lags. Keep the
+                # staged control file for that recovery path. Before the event,
+                # there is no committed transition, so rollback is safe.
+                if not state_committed and not event_appended:
+                    self._restore_control_files(control_backups)
+                raise
             _crash_checkpoint("finish_after_state_replace")
             op.mark_committed()
             return {

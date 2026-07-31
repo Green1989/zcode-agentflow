@@ -209,4 +209,3 @@ def build_engine_for_init(ctx: RunContext, *, target_repo: str, run_id: str | No
     # workflow_init (avoids a second new_run_id() that would desync paths).
     eng._resolved_run_id = rid  # type: ignore[attr-defined]
     return eng
-

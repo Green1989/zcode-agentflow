@@ -45,6 +45,8 @@ from zcode_agentflow import canonical
 __all__ = [
     "ApprovalUnavailableError",
     "resolve_approval_mode",
+    "build_approval_record",
+    "persist_approval_record",
     "record_approval",
     "SECURITY_WARNING",
 ]
@@ -117,16 +119,15 @@ def _approval_id(*, run_id: str, gate: str, artifact_sha256: str) -> str:
     return "apr_" + h.hexdigest()[:16]
 
 
-def record_approval(
+def build_approval_record(
     *,
-    control_root,
     run_id: str,
     gate: str,
     artifact_sha256: str,
     commit_at_approval: str,
     effective_approval_mode: str | None,
 ) -> dict:
-    """Write a trusted approval record and return it (Spec §4.6).
+    """Build a trusted approval record without writing it (Spec §4.6).
 
     ``effective_approval_mode`` is the value resolved by
     :func:`resolve_approval_mode` / the Engine startup gate
@@ -137,10 +138,10 @@ def record_approval(
       - fallback⇒ record with ``approval_method="non_adversarial_convention"``
                    AND a non-empty ``security_warning`` ZCode must display.
 
-    The record is persisted as canonical JSON under
-    ``control_root/approvals/<approval_id>.json`` via the canonical writer
-    (atomic, LF, one trailing newline). The record is returned exactly as
-    written so callers can round-trip it.
+    The caller may persist the returned record directly or stage it in the
+    Store's finish transaction. Keeping construction separate from persistence
+    prevents an approval record from becoming durable before the state
+    transition it authorizes has committed.
     """
     if effective_approval_mode not in (STRONG, FALLBACK, None):
         raise ValueError(
@@ -169,7 +170,41 @@ def record_approval(
     if effective_approval_mode == FALLBACK:
         record["security_warning"] = SECURITY_WARNING
 
+    return record
+
+
+def persist_approval_record(control_root, record: dict) -> None:
+    """Persist an already validated approval record as canonical JSON."""
+    approval_id = record.get("approval_id")
+    if not isinstance(approval_id, str) or not approval_id:
+        raise ValueError("approval record must contain a non-empty approval_id")
     approvals_dir = Path(control_root) / "approvals"
     approvals_dir.mkdir(parents=True, exist_ok=True)
     canonical.write_canonical_json(approvals_dir / f"{approval_id}.json", record)
+
+
+def record_approval(
+    *,
+    control_root,
+    run_id: str,
+    gate: str,
+    artifact_sha256: str,
+    commit_at_approval: str,
+    effective_approval_mode: str | None,
+) -> dict:
+    """Build and persist a trusted approval record (Spec §4.6).
+
+    This compatibility wrapper retains the Phase 5 standalone API. Engine
+    workflows use :func:`build_approval_record` and stage the resulting JSON
+    through ``Store.finish_operation`` so the record and state transition share
+    one commit boundary.
+    """
+    record = build_approval_record(
+        run_id=run_id,
+        gate=gate,
+        artifact_sha256=artifact_sha256,
+        commit_at_approval=commit_at_approval,
+        effective_approval_mode=effective_approval_mode,
+    )
+    persist_approval_record(control_root, record)
     return record

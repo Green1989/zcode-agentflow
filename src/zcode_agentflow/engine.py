@@ -9,10 +9,8 @@ Engine总不变量 (Prompt §6):
   1. ALLOWED_FROM + CAS + artifact rehash run inside ``Store.begin_operation``'s
      single locked critical section. There is NO second Run Lock and no nested
      ``_guard`` lock (P0-3). ``begin_operation`` already enforces ALLOWED_FROM +
-     CAS + the one-active-op gate under its lock; this module ADDS the on-disk
-     artifact rehash by running ``verify_locked_artifacts`` right after a
-     successful begin (still no extra lock — begin returned, so the rehash is a
-     read of the generation the state points at).
+     CAS + the one-active-op gate under its lock; this module supplies the
+     on-disk artifact rehash as the Store's in-lock begin validator.
   2. Every external call is strictly ``begin → adapter (no lock) → finish``.
   3. Authoritative artifacts are read/written ONLY via the ArtifactResolver /
      ``prepare_generation``; never direct ``control_root/SPEC.md`` writes.
@@ -28,8 +26,8 @@ Engine总不变量 (Prompt §6):
   9. READY_TO_MERGE marks the active pointer ``terminal:true``; no push, no merge.
 
 Task 6.1 ships the scaffold ONLY: the authoritative ``ALLOWED_FROM`` table, the
-``_begin`` helper that runs ALLOWED_FROM+CAS (via the Store) and rehashes the
-locked artifacts, the shared hard-check primitives, and the read-only
+  ``_begin`` helper that runs ALLOWED_FROM+CAS + locked-artifact rehash (via the
+  Store), the shared hard-check primitives, and the read-only
 ``check_stop(run_id)`` consumed by the Phase-7 Stop hook.
 """
 
@@ -141,11 +139,8 @@ class Engine:
     # _begin — ALLOWED_FROM + CAS + artifact rehash (P0-3)
     #
     # begin_operation takes the per-Run lock and enforces ALLOWED_FROM + CAS +
-    # the one-active-op gate INSIDE that single critical section. There is no
-    # second lock. The artifact rehash (verify_locked_artifacts) reads the
-    # generation the state points at; it is a read-only check that needs no
-    # extra lock (state.json is atomic on disk, and the generation is immutable
-    # once committed).
+    # the one-active-op gate INSIDE that single critical section. The artifact
+    # rehash is passed as a validator so it runs under that same lock too.
     # ------------------------------------------------------------------
 
     def _begin(
@@ -158,33 +153,20 @@ class Engine:
         intermediate_state: str,
         replay_policy: str,
     ) -> "store.BeginResult":
-        br = self.store.begin_operation(
+        def verify_locked_artifacts(state):
+            artifacts.verify_locked_artifacts(
+                state, ArtifactResolver(self.roots.control_root, state)
+            )
+
+        return self.store.begin_operation(
             operation_id=operation_id,
             request=request,
             tool=tool,
             expected_revision=expected_revision,
             intermediate_state=intermediate_state,
             replay_policy=replay_policy,
+            begin_validator=verify_locked_artifacts,
         )
-        # rehash the locked artifacts against the post-begin state. The state
-        # did not change its artifact_generation during begin (only revision +
-        # active_operation_id), so this validates the SAME committed generation.
-        # If the rehash detects drift/tampering, the op is already ACTIVE on disk
-        # (begin committed the intermediate state + active op). We must route it
-        # to NEEDS_HUMAN via fail_operation (using br's lease) BEFORE re-raising,
-        # so the run is never stranded mid-external (P0-2).
-        try:
-            state = store.State.load(self.roots.control_root)
-            artifacts.verify_locked_artifacts(
-                state, ArtifactResolver(self.roots.control_root, state)
-            )
-        except BaseException:
-            self.store.fail_operation(
-                operation_id=operation_id, lease_token=br.lease_token,
-                reason=f"{tool} artifact rehash failed at begin",
-            )
-            raise
-        return br
 
     # ------------------------------------------------------------------
     # read-only helpers
@@ -196,6 +178,39 @@ class Engine:
     def _resolver(self, state=None) -> ArtifactResolver:
         st = state if state is not None else self._load_state()
         return ArtifactResolver(self.roots.control_root, st)
+
+    def _resolve_approval_method(self) -> str | None:
+        """Resolve the record-level approval method at the workflow boundary.
+
+        ``prefer_zcode_tool_confirmation`` is a capability/config intent, not
+        proof that the specific MCP tool is configured to prompt. Only an
+        explicit ``confirmation_configured`` flag can turn that intent into a
+        strong record; otherwise the configured fallback policy decides.
+        """
+        mode = self.effective_config.get("effective_approval_mode")
+        if mode in (approval.STRONG, approval.FALLBACK):
+            return mode
+        if mode != "prefer_zcode_tool_confirmation":
+            return None
+
+        spec_approval = (
+            (self.config or {}).get("human_gates", {}).get("spec_approval", {})
+            or {}
+        )
+        return approval.resolve_approval_mode(
+            tool_confirmation_supported=bool(
+                self.effective_config.get("tool_confirmation_supported", True)
+            ),
+            confirmation_configured=bool(
+                self.effective_config.get("confirmation_configured", False)
+            ),
+            allow_non_adversarial_fallback=bool(
+                self.effective_config.get(
+                    "allow_non_adversarial_fallback",
+                    spec_approval.get("allow_non_adversarial_fallback", False),
+                )
+            ),
+        )
 
     # ------------------------------------------------------------------
     # Operation-id helpers (Task 6.2; Prompt §15; Review §二)
@@ -405,16 +420,9 @@ class Engine:
         """
         state = self._load_state()
         op_id = self._op_id("workflow_approve_spec", expected_revision)
-        # resolve the approval method ONCE (the effective_config was fixed at
-        # startup by validate_capabilities; do not re-derive here).
-        mode = self.effective_config.get("effective_approval_mode")
-        # the canonical strong method; the fallback string maps to the constant.
-        if mode == "zcode_tool_confirmation" or mode == "prefer_zcode_tool_confirmation":
-            effective = approval.STRONG
-        elif mode == "non_adversarial_convention":
-            effective = approval.FALLBACK
-        else:
-            effective = None  # triggers ApprovalUnavailableError below
+        # Resolve once at the workflow boundary. A capability preference is not
+        # itself evidence that the tool is configured to prompt.
+        effective = self._resolve_approval_method()
 
         request = {
             "tool": "workflow_approve_spec",
@@ -427,9 +435,10 @@ class Engine:
             intermediate_state="PLANNING", replay_policy="SAFE_READ",
         )
         try:
-            # record_approval writes the trusted record (raises if mode is None).
-            rec = approval.record_approval(
-                control_root=self.roots.control_root,
+            # Build the record, then stage it with the state transition. The
+            # Store owns the commit boundary, so a failed finish cannot leave an
+            # approval for a state that never reached PLANNING.
+            rec = approval.build_approval_record(
                 run_id=state.run_id, gate="SPEC",
                 artifact_sha256=state.spec_sha256,
                 commit_at_approval=state.base_commit or "",
@@ -439,6 +448,10 @@ class Engine:
                 operation_id=op_id, lease_token=br.lease_token,
                 expected_revision=br.revision_after_begin,
                 next_state="PLANNING", staged_artifacts={}, result=rec,
+                staged_control_files={
+                    f"approvals/{rec['approval_id']}.json":
+                        canonical.canonical_json_bytes(rec),
+                },
             )
             return {
                 "state": committed["state"], "revision": committed["revision"],
@@ -581,11 +594,11 @@ class Engine:
                 expected_revision=br.revision_after_begin,
                 next_state="READY_FOR_EXECUTION", staged_artifacts=staged,
                 result=final,
+                state_updates={"current_task": raw_task["id"]},
             )
             st = self._load_state()
-            # current_task = the single task id; plan/manifest shas from resolver.
-            st.current_task = raw_task["id"]
-            st.save(self.roots.control_root)
+            # current_task and plan/manifest shas were committed together by
+            # Store.finish_operation; only read/assert after the commit.
             assert st.plan_sha256 == self._resolver(st).hash_of("PLAN.md")
             assert st.task_manifest_sha256 == self._resolver(st).hash_of("task-manifest.json")
             return {
@@ -629,11 +642,8 @@ class Engine:
                 expected_revision=br.revision_after_begin,
                 next_state="EXECUTING_TASK", staged_artifacts={},
                 result={"task_id": task_id, "task_start_commit": start_commit},
+                state_updates={"task_start_commit": start_commit},
             )
-            # record task_start_commit in state (authoritative base for the audit).
-            st = self._load_state()
-            st.task_start_commit = start_commit
-            st.save(self.roots.control_root)
             return {
                 "state": committed["state"], "revision": committed["revision"],
                 "task_start_commit": start_commit, "operation_id": op_id,
@@ -737,20 +747,19 @@ class Engine:
             )
 
             next_state = "VERIFYING_TASK" if status == "READY_FOR_REVIEW" else "NEEDS_HUMAN"
+            state_updates = {}
+            if status == "READY_FOR_REVIEW":
+                state_updates["verified_head_commit"] = head
             committed = self.store.finish_operation(
                 operation_id=op_id, lease_token=br.lease_token,
                 expected_revision=br.revision_after_begin,
                 next_state=next_state,
                 staged_artifacts={"execution-result.json": canonical.canonical_json_bytes(exec_result)},
                 result=exec_result,
+                state_updates=state_updates,
             )
             st = self._load_state()
             assert st.execution_result_sha256 == self._resolver(st).hash_of("execution-result.json")
-            # consistency #3: record the VERIFIED head so reviewer_review_task can
-            # bind against it (HEAD == verified_head_commit pre-review).
-            if status == "READY_FOR_REVIEW":
-                st.verified_head_commit = head
-                st.save(self.roots.control_root)
             return {
                 "status": status, "state": committed["state"],
                 "revision": committed["revision"],
@@ -862,20 +871,22 @@ class Engine:
 
             decision = final["decision"]
             next_state = "REVIEWING_TASK" if decision == "PASS" else "NEEDS_HUMAN"
+            state_updates = {}
+            if decision == "PASS":
+                state_updates = {
+                    "last_reviewed_commit": head,
+                    "review_round": state.review_round + 1,
+                }
             committed = self.store.finish_operation(
                 operation_id=op_id, lease_token=br.lease_token,
                 expected_revision=br.revision_after_begin,
                 next_state=next_state,
                 staged_artifacts={"review-result.json": canonical.canonical_json_bytes(final)},
                 result=final,
+                state_updates=state_updates,
             )
             st = self._load_state()
             assert st.review_result_sha256 == self._resolver(st).hash_of("review-result.json")
-            # consistency #3: last_reviewed_commit is set ONLY after a PASS review.
-            if decision == "PASS":
-                st.last_reviewed_commit = head
-                st.review_round = state.review_round + 1
-                st.save(self.roots.control_root)
             return {
                 "decision": decision, "state": committed["state"],
                 "revision": committed["revision"], "head_commit": head,
@@ -915,6 +926,7 @@ class Engine:
             expected_revision=expected_revision,
             intermediate_state="REVIEWING_TASK", replay_policy="SAFE_READ",
         )
+        finish_committed = False
         try:
             # run the shared hard-check set (Review §六.6: same primitives as
             # check_stop — hook and engine never drift).
@@ -933,6 +945,7 @@ class Engine:
                 next_state="READY_TO_MERGE", staged_artifacts={},
                 result={"hard_checks": [list(c) for c in checks]},
             )
+            finish_committed = True
             st = self._load_state()
             # mark the active-run pointer terminal (Task 6.8 lifecycle). The
             # pointer is retained (NOT cleared) so workflow_status can read the
@@ -947,10 +960,15 @@ class Engine:
                 "checks": [list(c) for c in checks], "operation_id": op_id,
             }
         except BaseException:
-            self.store.fail_operation(
-                operation_id=op_id, lease_token=br.lease_token,
-                reason="workflow_complete_task failure",
-            )
+            # Once finish commits, the lease is cleared and fail_operation would
+            # raise a misleading ActiveOperationMismatch while obscuring the
+            # real pointer-handoff error. Leave the terminal state durable and
+            # surface the pointer failure for explicit repair instead.
+            if not finish_committed:
+                self.store.fail_operation(
+                    operation_id=op_id, lease_token=br.lease_token,
+                    reason="workflow_complete_task failure",
+                )
             raise
 
     # ------------------------------------------------------------------

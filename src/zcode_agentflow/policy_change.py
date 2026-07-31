@@ -156,18 +156,24 @@ def audit(
             # duplicating N+1 reasons for N unauthorized deletes).
             continue
 
-        # ---- RENAME / COPY: both old and new path. Treat as a single authorized
-        # change when the NEW path is declared (refactor/rename). Do NOT count
-        # the old path as a delete (it moved, not removed) — Spec §5.3 correction.
+        # ---- RENAME / COPY: inspect both old and new paths. The old path is
+        # not a deletion and is implicitly in scope when the new path is the
+        # declared rename target, but it still contributes dependency and
+        # irreversible-risk classification. The new path receives the normal
+        # declared-file check and R/C migration-added semantics.
         if kind in ("R", "C"):
-            # the new path is the effective touched file; check it against
-            # declared/dependency/migration rules like an add/modify. A rename/
-            # copy's NEW path counts as an ADDED migration (kind passed).
-            _classify_path(
-                new_posix, kind, declared, dep_pats, mig_pats, irr_pats,
-                dependency_files, migrations_added, undeclared_files,
-            )
-            if _matches_any(new_posix, irr_pats):
+            if old_posix:
+                _classify_path(
+                    old_posix, "M", declared, dep_pats, mig_pats, irr_pats,
+                    dependency_files, migrations_added, undeclared_files,
+                    check_declared=False,
+                )
+            if new_posix:
+                _classify_path(
+                    new_posix, kind, declared, dep_pats, mig_pats, irr_pats,
+                    dependency_files, migrations_added, undeclared_files,
+                )
+            if _matches_any(old_posix, irr_pats) or _matches_any(new_posix, irr_pats):
                 irreversible = True
             continue
 
@@ -230,6 +236,8 @@ def _classify_path(
     dependency_files: list,
     migrations_added: list,
     undeclared_files: list,
+    *,
+    check_declared: bool = True,
 ) -> None:
     """Classify an added/modified/renamed-new path into dependency / migration /
     undeclared buckets (mutates the passed lists).
@@ -242,14 +250,10 @@ def _classify_path(
     dependency manifest modification is still a dependency change, and an edit
     to a non-declared file is still out-of-scope.
     """
-    is_dep = _matches_any(path, dep_pats)
-    is_mig = _matches_any(path, mig_pats)
-    if is_dep:
+    if _matches_any(path, dep_pats):
         dependency_files.append(path)
-        return
-    if is_mig and kind in ("A", "R", "C"):
+    if _matches_any(path, mig_pats) and kind in ("A", "R", "C"):
         # only a genuinely NEW migration file counts as "added"
         migrations_added.append(path)
-        return
-    if path not in declared:
+    if check_declared and path not in declared:
         undeclared_files.append(path)

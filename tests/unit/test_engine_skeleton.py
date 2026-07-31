@@ -118,15 +118,28 @@ def test_guard_runs_inside_begin_not_separately(control_root, monkeypatch):
     eng = _engine(control_root)
 
     counter = {"n": 0}
+    held = {"value": False}
     orig = locks.run_lock
 
     @contextlib.contextmanager
     def counting_run_lock(cr, timeout=30):
         counter["n"] += 1
         with orig(cr, timeout=timeout):
-            yield
+            held["value"] = True
+            try:
+                yield
+            finally:
+                held["value"] = False
 
     monkeypatch.setattr(locks, "run_lock", counting_run_lock)
+
+    original_verify = artifacts.verify_locked_artifacts
+
+    def verify_while_locked(state, resolver):
+        assert held["value"] is True
+        return original_verify(state, resolver)
+
+    monkeypatch.setattr(artifacts, "verify_locked_artifacts", verify_while_locked)
 
     br = eng._begin(
         tool="planner_draft_spec",
