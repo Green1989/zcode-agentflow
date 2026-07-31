@@ -1392,6 +1392,11 @@ class State:
     base_commit: str | None = None
     task_start_commit: str | None = None
     last_reviewed_commit: str | None = None
+    # consistency #3 (Task 6.5): the HEAD that was VERIFIED by workflow_verify_task
+    # (== execution_result.head_commit). Distinct from last_reviewed_commit (set
+    # only AFTER a successful review). Pre-review the engine binds against
+    # verified_head_commit, NOT last_reviewed_commit.
+    verified_head_commit: str | None = None
     review_round: int = 0
     repair_round: int = 0
     updated_at: str = field(default_factory=_utc_now_iso)
@@ -1435,6 +1440,7 @@ class State:
             "base_commit",
             "task_start_commit",
             "last_reviewed_commit",
+            "verified_head_commit",
             "artifact_generation",
             "active_operation_id",
             "active_operation_lease",
@@ -1499,6 +1505,7 @@ class State:
             base_commit=d.get("base_commit"),
             task_start_commit=d.get("task_start_commit"),
             last_reviewed_commit=d.get("last_reviewed_commit"),
+            verified_head_commit=d.get("verified_head_commit"),
             review_round=d.get("review_round", 0),
             repair_round=d.get("repair_round", 0),
             updated_at=d.get("updated_at", _utc_now_iso()),

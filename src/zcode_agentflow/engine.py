@@ -50,6 +50,7 @@ from zcode_agentflow import (
     manifest,
     policy_change,
     prompts,
+    review_bundle,
     schemas,
     store,
 )
@@ -734,6 +735,11 @@ class Engine:
             )
             st = self._load_state()
             assert st.execution_result_sha256 == self._resolver(st).hash_of("execution-result.json")
+            # consistency #3: record the VERIFIED head so reviewer_review_task can
+            # bind against it (HEAD == verified_head_commit pre-review).
+            if status == "READY_FOR_REVIEW":
+                st.verified_head_commit = head
+                st.save(self.roots.control_root)
             return {
                 "status": status, "state": committed["state"],
                 "revision": committed["revision"],
@@ -743,6 +749,131 @@ class Engine:
             self.store.fail_operation(
                 operation_id=op_id, lease_token=br.lease_token,
                 reason="workflow_verify_task failure",
+            )
+            raise
+
+    # ==================================================================
+    # Tool 7: reviewer_review_task (Review Bundle + hash injection; P0-5)
+    # ==================================================================
+
+    def reviewer_review_task(self, *, task_id: str, expected_revision: int) -> dict:
+        """VERIFYING_TASK → REVIEWING_TASK (PASS) / NEEDS_HUMAN (FAIL/REPLAN/BLOCKED).
+
+        consistency #3 (load-bearing): BEFORE the review call the engine asserts
+        ``HEAD == execution_result.head_commit`` AND ``HEAD ==
+        state.verified_head_commit``. It does NOT consult
+        ``last_reviewed_commit`` pre-review — that field is set ONLY after a
+        successful PASS. The Review Bundle is assembled (read-only artifacts via
+        the resolver) and Grok reviews it; the RAW decision is validated, then
+        authoritative context (run_id/task_id/commits/hashes) is INJECTED from
+        state and the FINAL review-result is validated. On PASS,
+        ``state.last_reviewed_commit = review head``.
+        """
+        from zcode_agentflow.adapters.grok import GrokAdapter
+
+        ids.validate_task_id(task_id)
+        state = self._load_state()
+        op_id = self._op_id("reviewer_review_task", expected_revision)
+        request = {"tool": "reviewer_review_task",
+                   "args": {"task_id": task_id}}
+        br = self._begin(
+            tool="reviewer_review_task", operation_id=op_id, request=request,
+            expected_revision=expected_revision,
+            intermediate_state="REVIEWING_TASK", replay_policy="COSTFUL_READ",
+        )
+        try:
+            wt = self.roots.run_worktree_root
+            resolver = self._resolver(state)
+            # consistency #3: bind HEAD to the verified head BEFORE review.
+            head = gitops.head(wt)
+            exec_obj = json.loads(resolver.read("execution-result.json"))
+            exec_head = exec_obj["head_commit"]
+            verified = getattr(state, "verified_head_commit", None)
+            if head != exec_head or (verified is not None and head != verified):
+                raise WorkflowError(
+                    f"HEAD {head!r} != execution_result.head_commit {exec_head!r}"
+                    f" / verified_head_commit {verified!r}; refusing to review a "
+                    f"moved tree (route to NEEDS_HUMAN)"
+                )
+            # worktree must be clean at review time (GrokAdapter re-checks too).
+            if not gitops.is_clean(wt):
+                raise WorkflowError(
+                    "worktree not clean at review time; route to NEEDS_HUMAN"
+                )
+
+            # read the task + assemble the immutable Review Bundle (read-only).
+            man = json.loads(resolver.read("task-manifest.json"))
+            task = man["tasks"][0]
+            agent_context = self._resolved_agent_context()
+            review_prompt = prompts.render("reviewer.md", agent_context=agent_context)
+            bdir = review_bundle.assemble(
+                operation_dir=br.staging_dir, resolver=resolver,
+                run_worktree_root=wt, base_commit=state.base_commit,
+                head_commit=head, task=task, exec_result=exec_obj,
+                resolved_agent_context=agent_context, review_prompt=review_prompt,
+                review_round=state.review_round + 1,
+            )
+
+            grok = self.adapters.get("grok") or GrokAdapter()
+            grok_req = {
+                "bundle_dir": str(bdir),
+                "repo_root": str(self.roots.target_repo_root),
+                "schema_path": str(schemas.SCHEMAS_DIR / "review-decision.schema.json"),
+                "proxy": self.config.get("reviewer", {}).get("proxy", {}),
+            }
+            result = grok.invoke(
+                request=grok_req, repo_cwd=bdir, operation_dir=br.staging_dir,
+                timeout=self._adapter_timeout("reviewer"),
+            )
+            if result.exit_code != 0 or result.parsed is None:
+                raise WorkflowError(
+                    f"reviewer_review_task adapter failed (exit={result.exit_code})"
+                )
+            raw = result.parsed
+            # inject authoritative context from state (P0-5: never trust model).
+            final = {
+                "run_id": state.run_id, "task_id": task_id,
+                "base_commit": state.base_commit, "head_commit": head,
+                "spec_sha256": state.spec_sha256, "plan_sha256": state.plan_sha256,
+                "task_manifest_sha256": state.task_manifest_sha256,
+                "plan_version": state.plan_version,
+                "decision": raw["decision"],
+                "spec_compliance": raw["spec_compliance"],
+                "plan_compliance": raw["plan_compliance"],
+                "tests_sufficient": raw["tests_sufficient"],
+                "issues": raw.get("issues", []),
+                "replan_required": raw["replan_required"],
+            }
+            schemas.validate_review(final)
+            (Path(br.staging_dir) / "out.json").write_text(
+                json.dumps(final, ensure_ascii=False), encoding="utf-8"
+            )
+
+            decision = final["decision"]
+            next_state = "REVIEWING_TASK" if decision == "PASS" else "NEEDS_HUMAN"
+            committed = self.store.finish_operation(
+                operation_id=op_id, lease_token=br.lease_token,
+                expected_revision=br.revision_after_begin,
+                next_state=next_state,
+                staged_artifacts={"review-result.json": canonical.canonical_json_bytes(final)},
+                result=final,
+            )
+            st = self._load_state()
+            assert st.review_result_sha256 == self._resolver(st).hash_of("review-result.json")
+            # consistency #3: last_reviewed_commit is set ONLY after a PASS review.
+            if decision == "PASS":
+                st.last_reviewed_commit = head
+                st.review_round = state.review_round + 1
+                st.save(self.roots.control_root)
+            return {
+                "decision": decision, "state": committed["state"],
+                "revision": committed["revision"], "head_commit": head,
+                "operation_id": op_id,
+            }
+        except BaseException:
+            self.store.fail_operation(
+                operation_id=op_id, lease_token=br.lease_token,
+                reason="reviewer_review_task failure",
             )
             raise
 
