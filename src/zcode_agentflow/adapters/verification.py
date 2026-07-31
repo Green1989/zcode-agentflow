@@ -129,16 +129,71 @@ def _check_bash_arg(arg: str) -> None:
         )
 
 
-def _build_cmd_argv(*, program: str, args: list[str]) -> list[str]:
+def _check_cmd_program(program: str) -> None:
+    """P0-4: the ``program`` (script path) for a cmd_script must pass the SAME
+    metacharacter + control-char rejection as its args. The arg whitelist is NOT
+    applied here because a script path legitimately contains path separators,
+    spaces, and drive letters; the injection defense is the metacharacter
+    rejection (a program carrying ``&|<>^%!()`` or CR/LF/NUL can break out of
+    the ``cmd.exe /c <program>`` token)."""
+    if not isinstance(program, str) or program == "":
+        raise VerificationError("cmd_script program must be a non-empty string")
+    if _has_ctrl(program):
+        raise VerificationError(
+            f"cmd_script program contains a control char (CR/LF/NUL): {program!r}"
+        )
+    if any(ch in _CMD_META for ch in program):
+        bad = sorted(set(program) & _CMD_META)
+        raise VerificationError(
+            f"cmd_script program contains cmd.exe metacharacter(s) {bad}: "
+            f"{program!r}"
+        )
+
+
+def _check_bash_program(program: str) -> None:
+    """P0-4: the ``program`` (script path) for a bash_script must pass the SAME
+    shell-metacharacter + control-char rejection as its args."""
+    if not isinstance(program, str) or program == "":
+        raise VerificationError("bash_script program must be a non-empty string")
+    if _has_ctrl(program):
+        raise VerificationError(
+            f"bash_script program contains a control char (CR/LF/NUL): {program!r}"
+        )
+    if any(ch in _BASH_META for ch in program):
+        bad = sorted(set(program) & _BASH_META)
+        raise VerificationError(
+            f"bash_script program contains shell metacharacter(s) {bad}: "
+            f"{program!r}"
+        )
+
+
+def _build_cmd_argv(*, script: Path, args: list[str]) -> list[str]:
     """Build the cmd.exe token list. NEVER concatenate program+args into a
     string; pass a list to ``subprocess.run(shell=False)``. ``/d`` disables
-    AutoRun; ``/s`` strips the first/last quotes; ``/c`` runs the command."""
-    return ["cmd.exe", "/d", "/s", "/c", program, *args]
+    AutoRun; ``/s`` strips the first/last quotes; ``/c`` runs the command.
+
+    ``script`` is the ALREADY-VALIDATED absolute script path (P0-4): the
+    interpreter must execute exactly the path that was containment-checked
+    under the worktree, not the bare ``program`` string that cmd.exe would
+    re-resolve against the command cwd (which may differ from the worktree).
+    """
+    return ["cmd.exe", "/d", "/s", "/c", str(script), *args]
 
 
-def _build_bash_argv(*, program: str, args: list[str]) -> list[str]:
-    """Build the bash token list (no concatenation, shell=False)."""
-    return ["bash", program, *args]
+def _build_bash_argv(*, script: Path, cwd: Path, args: list[str]) -> list[str]:
+    """Build the bash token list (no concatenation, shell=False).
+
+    P0-4: bash must execute the VALIDATED script, not the bare ``program`` that
+    bash would re-resolve against the command cwd (which may be a different
+    directory than the worktree root the program was validated against). We pass
+    a POSIX RELATIVE path from ``cwd`` to the validated ``script`` (forward
+    slashes) so bash — whose MSYS build mishandles Windows absolute paths like
+    ``C:\\...`` (exit 127) — resolves exactly the validated file from its own
+    cwd. ``os.path.relpath(validated_abs, cwd)`` always points at the validated
+    file regardless of where cwd sits within the worktree.
+    """
+    rel = os.path.relpath(str(script), str(cwd)).replace("\\", "/")
+    return ["bash", rel, *args]
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +290,10 @@ def run_verification(
             )
         argv = [program, *args]
     elif kind == "cmd_script":
+        # P0-4: validate the program string (metacharacters/control chars) — the
+        # same injection defense applied to args, since the program becomes the
+        # ``cmd.exe /c <program>`` token.
+        _check_cmd_program(program)
         # script must be under the worktree + .bat/.cmd
         script = _resolve_script_path(program, worktree_root)
         if script.suffix.lower() not in (".bat", ".cmd"):
@@ -251,9 +310,12 @@ def run_verification(
         # P1-1: reject metacharacters/control chars in EVERY arg
         for a in args:
             _check_cmd_arg(a)
-        # the program is run by its relative name under cwd (the worktree)
-        argv = _build_cmd_argv(program=program, args=args)
+        # P0-4: argv executes the VALIDATED absolute script path, not the bare
+        # program string (which cmd.exe would re-resolve against cwd, possibly a
+        # different file than the one containment-checked under the worktree).
+        argv = _build_cmd_argv(script=script, args=args)
     elif kind == "bash_script":
+        _check_bash_program(program)
         script = _resolve_script_path(program, worktree_root)
         if script.suffix.lower() != ".sh":
             raise VerificationError(
@@ -267,7 +329,7 @@ def run_verification(
             )
         for a in args:
             _check_bash_arg(a)
-        argv = _build_bash_argv(program=program, args=args)
+        argv = _build_bash_argv(script=script, cwd=cwd, args=args)
     else:
         raise VerificationError(
             f"unknown verification command kind {kind!r}; expected one of "

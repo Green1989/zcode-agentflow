@@ -102,13 +102,17 @@ def test_cmd_script_arg_whitelist_enforced():
 # ---------------------------------------------------------------------------
 
 
-def test_cmd_script_never_concatenates_program_and_args():
-    """The launcher builds a TOKEN LIST, never a single concatenated string."""
-    argv = _build_cmd_argv(program="run.bat", args=["T1", "--opt=val"])
+def test_cmd_script_never_concatenates_program_and_args(tmp_path):
+    """The launcher builds a TOKEN LIST, never a single concatenated string.
+
+    (P0-4: argv references the validated absolute ``script`` path, not the bare
+    program string.)"""
+    script = tmp_path / "run.bat"
+    argv = _build_cmd_argv(script=script, args=["T1", "--opt=val"])
     assert isinstance(argv, list)
     assert argv[0] == "cmd.exe"
-    # the program and each arg are SEPARATE tokens (no string built)
-    assert "run.bat" in argv
+    # the script and each arg are SEPARATE tokens (no string built)
+    assert str(script) in argv
     assert "T1" in argv
     assert "--opt=val" in argv
     # /d disables AutoRun; /s strips first/last quotes (standard safe form)
@@ -122,8 +126,11 @@ def test_bash_script_rejects_shell_metacharacters():
             _check_bash_arg(bad)
 
 
-def test_bash_script_argv_shape():
-    argv = _build_bash_argv(program="run.sh", args=["--flag", "value"])
+def test_bash_script_argv_shape(tmp_path):
+    script = tmp_path / "run.sh"
+    cwd = tmp_path
+    argv = _build_bash_argv(script=script, cwd=cwd, args=["--flag", "value"])
     assert argv[0] == "bash"
+    # the validated script is named (as a posix relpath from cwd)
     assert "run.sh" in argv
     assert "--flag" in argv and "value" in argv
