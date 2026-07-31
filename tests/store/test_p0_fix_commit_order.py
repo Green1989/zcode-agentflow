@@ -269,6 +269,59 @@ def test_roll_forward_copies_all_authoritative_sha_fields(tmp_path: Path, monkey
     )
 
 
+def test_roll_forward_restores_full_state_snapshot(tmp_path: Path, monkeypatch):
+    """P1-A (re-review): Case C must restore the FULL authoritative snapshot,
+    not a hand-picked subset. A finish can update any State field the Engine
+    advanced (current_task, completed_tasks, plan_version, review_round,
+    repair_round, the *_sha256 set, base_commit). If Case C copies only some,
+    the rolled-forward state silently reverts the rest to their pre-finish
+    values. Assert the whole snapshot is restored.
+    """
+    control = tmp_path / "control"
+    control.mkdir()
+    # seed with NON-default values so a partial copy is detectable
+    st = store.State(
+        run_id="20260730120000-abc123",
+        revision=1,
+        state="INITIALIZING_WORKTREE",
+        previous_state="NEW",
+        plan_version=7,
+        current_task="T003",
+        completed_tasks=["T001", "T002"],
+        roots={
+            "plugin_root": str(control / "plugin"),
+            "target_repo_root": str(control / "repo"),
+            "run_worktree_root": str(control / "wt"),
+            "control_root": str(control),
+        },
+        review_round=2,
+        repair_round=1,
+    )
+    st.save(control)
+    s = store.Store(control)
+
+    br = _begin(s)
+    monkeypatch.setenv("AGENTFLOW_CRASH_AFTER", "finish_after_event")
+    with pytest.raises(store.CrashInjected):
+        s.finish_operation(
+            operation_id=br.operation_id,
+            lease_token=br.lease_token,
+            expected_revision=br.revision_after_begin,
+            next_state="READY_FOR_SPEC_APPROVAL",
+            staged_artifacts={"SPEC.md": b"# Spec\n"},
+            result={"ok": True},
+        )
+
+    fresh = store.Store(control)
+    recovered = fresh.recover()
+    # the FULL committed snapshot must be restored, not a partial field copy
+    assert recovered.plan_version == 7
+    assert recovered.current_task == "T003"
+    assert recovered.completed_tasks == ["T001", "T002"]
+    assert recovered.review_round == 2
+    assert recovered.repair_round == 1
+
+
 def _all_events(control: Path) -> list[dict]:
     path = control / "events.jsonl"
     if not path.exists():

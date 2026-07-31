@@ -791,7 +791,10 @@ class Store:
             snap_rel, snap_sha = op.write_state_snapshot(
                 "state_after_unknown", state.to_dict()
             )
-            state.save(self.control_root)
+            # Same commit order as finish/fail (P0-1/P1-D): append+fsync the
+            # recoverable event BEFORE the state.json replace, so a crash here
+            # (or a later state.json corruption) can still reconstruct the
+            # UNKNOWN transition + classification from the durable event.
             EventLog(self.control_root).append(
                 operation_id=operation_id,
                 from_state=pre_state,
@@ -801,6 +804,7 @@ class Store:
                 state_after_sha=snap_sha,
                 revision=state.revision,
             )
+            state.save(self.control_root)
             return {
                 "operation_id": operation_id,
                 "status": "UNKNOWN",
@@ -959,30 +963,15 @@ class Store:
         # commit; only the state.json mirror lagged).
         if snap_active is None and op.has_result():
             rolled = State.from_dict(snap)
-            # mutate the in-memory state the caller is reconciling, in place,
-            # so recover()'s subsequent steps (orphan classification, persistence)
-            # see the rolled-forward view. The snapshot already reflects the
-            # committed transition (state advanced, active op cleared, artifact
-            # pointer set), so every relevant field is copied.
-            state.state = rolled.state
-            state.previous_state = rolled.previous_state
-            state.revision = rolled.revision
-            state.active_operation_id = rolled.active_operation_id
-            state.active_operation_lease = rolled.active_operation_lease
-            state.artifact_generation = rolled.artifact_generation
-            # ALL authoritative artifact shas the finish folded into its snapshot
-            # (prepare_generation fills the full NAME_TO_STATE_SHA set). Copying
-            # only artifact_generation + the two *_result shas would leave the
-            # rolled-forward state pointing at the NEW generation but carrying the
-            # OLD spec/plan/manifest shas, breaking the
-            # 'state sha == blob sha of the pointed generation' invariant.
-            state.spec_sha256 = rolled.spec_sha256
-            state.plan_sha256 = rolled.plan_sha256
-            state.task_manifest_sha256 = rolled.task_manifest_sha256
-            state.execution_result_sha256 = rolled.execution_result_sha256
-            state.review_result_sha256 = rolled.review_result_sha256
-            # authoritative fields the finish folded into its commit (P0-2):
-            state.base_commit = rolled.base_commit
+            # Restore the FULL authoritative committed snapshot in place (the
+            # snapshot is the durable, sha-verified view the finish wrote). We
+            # replace every field rather than hand-picking a subset, so a future
+            # finish that advances current_task / completed_tasks / plan_version /
+            # review_round / repair_round / any *_sha256 / base_commit is not
+            # silently reverted to its pre-finish value (P1-A: a partial copy
+            # list drifts as State grows). recover()'s caller continues to see
+            # the rolled-forward view through this same `state` object.
+            state.__dict__.update(rolled.__dict__)
             op.mark_committed()
 
     def _verify_generation_blobs(self, state: State) -> None:

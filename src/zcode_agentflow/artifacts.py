@@ -272,6 +272,21 @@ class ArtifactResolver:
         return self.read(logical_name).decode("utf-8")
 
     def hash_of(self, logical_name: str) -> str:
-        """Return the authoritative sha256 of ``logical_name`` (from the index,
-        which equals the canonical sha of its blob)."""
-        return self._ref(logical_name)["sha256"]
+        """Return the authoritative sha256 of ``logical_name``.
+
+        Integrity-checked (Spec §4.7, P1-B): the sha is RECOMPUTED over the
+        blob's actual on-disk bytes and compared to the manifest's recorded sha.
+        A mismatch (tampering / corruption) raises :class:`ArtifactCorrupt`
+        rather than handing back the manifest's value — otherwise a downstream
+        hard-check binding that only calls ``hash_of`` could accept a tampered
+        blob's manifest sha as if it were authoritative.
+        """
+        ref = self._ref(logical_name)
+        bpath = self.control_root / ref["blob"]
+        actual = canonical.sha256_hex(bpath.read_bytes())
+        if actual != ref["sha256"]:
+            raise ArtifactCorrupt(
+                f"artifact {logical_name!r} blob sha mismatch: manifest "
+                f"{ref['sha256']!r} != on-disk {actual!r} at {ref['blob']!r}"
+            )
+        return actual

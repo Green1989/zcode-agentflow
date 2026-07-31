@@ -95,7 +95,7 @@ def test_resolver_read_detects_tampered_blob(tmp_path: Path):
     bpath = control / ref["blob"]
     bpath.write_bytes(b"# TAMPERED CONTENT\n")
 
-    with pytest.raises(Exception):
+    with pytest.raises(artifacts.ArtifactCorrupt):
         # must FAIL CLOSED — recompute sha, mismatch -> raise. Today it returns
         # the tampered bytes silently.
         resolver.read("SPEC.md")
@@ -121,13 +121,33 @@ def test_recover_refuses_tampered_blob_in_pointed_generation(tmp_path: Path):
     spec_ref = gen.index["SPEC.md"]
     (control / spec_ref["blob"]).write_bytes(b"# TAMPERED\n")
 
-    # a fresh Store recovering must surface the corruption (fail closed).
+    # a fresh Store recovering must surface the corruption (fail closed):
+    # recover() ITSELF rehashes and raises (P0-1) — not just a later read.
     fresh = store.Store(control)
-    with pytest.raises(Exception):
-        # Either recover() itself raises, OR reading through the recovered
-        # state raises. The invariant: tampering must NOT pass silently.
-        recovered = fresh.recover()
-        artifacts.ArtifactResolver(control, recovered).read("SPEC.md")
+    with pytest.raises((store.StateCorruptError, artifacts.ArtifactCorrupt)):
+        fresh.recover()
+
+
+def test_hash_of_rehashes_and_detects_tampered_blob(tmp_path: Path):
+    """P1-B: hash_of() must not trust the manifest's sha blindly. It re-reads
+    the blob, recomputes its sha, and FAILS CLOSED (raises ArtifactCorrupt) if
+    that differs from the manifest — so a downstream hard-check binding that
+    only calls hash_of() cannot pick up a tampered blob's manifest sha as if it
+    were authoritative.
+    """
+    control = tmp_path / "control"
+    control.mkdir()
+    st = _commit_spec(control, body=b"# Spec\n")
+    resolver = artifacts.ArtifactResolver(control, st)
+    original_sha = resolver.hash_of("SPEC.md")
+    assert original_sha  # sanity
+
+    # tamper the blob in place
+    ref = resolver._ref("SPEC.md")
+    (control / ref["blob"]).write_bytes(b"# TAMPERED\n")
+
+    with pytest.raises(artifacts.ArtifactCorrupt):
+        resolver.hash_of("SPEC.md")
 
 
 def test_recover_itself_fails_closed_on_tampered_blob(tmp_path: Path):
@@ -166,7 +186,7 @@ def test_recover_fails_closed_on_missing_manifest(tmp_path: Path):
     shutil.rmtree(control / "artifacts" / st.artifact_generation)
 
     fresh = store.Store(control)
-    with pytest.raises(Exception):
+    with pytest.raises(store.StateCorruptError):
         fresh.recover()
 
 
@@ -183,7 +203,7 @@ def test_recover_fails_closed_on_missing_blob(tmp_path: Path):
     (control / gen.index["SPEC.md"]["blob"]).unlink()  # manifest stays, blob gone
 
     fresh = store.Store(control)
-    with pytest.raises(Exception):
+    with pytest.raises(store.StateCorruptError):
         fresh.recover()
 
 
