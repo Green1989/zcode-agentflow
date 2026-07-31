@@ -102,6 +102,13 @@ class CodexAdapter:
             "exec",
             # prompt via stdin (no positional PROMPT) — Review P0-3
             "-s", str(request.get("sandbox", "read-only")),   # read-only sandbox
+            # AF-7: codex 0.146.0 exits 1 ('Not inside a trusted directory') when
+            # pointed at a repo not in the user's codex trust list. AgentFlow runs
+            # codex under a read-only sandbox over a dedicated git worktree branched
+            # from the user's already-trusted target_repo, so codex's own trust
+            # check is redundant and would otherwise block every non-pre-trusted
+            # target_repo (read-only => no mutation possible regardless).
+            "--skip-git-repo-check",
             "-C", str(repo_cwd),                              # cwd = run worktree (P0-4)
             "--output-schema", str(schema_path),              # RAW schema constraint
             "-o", str(Path(operation_dir) / "out.json"),      # output -> operation staging

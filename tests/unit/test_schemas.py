@@ -619,3 +619,60 @@ def test_schemas_are_strict_additional_properties():
         assert schema.get("additionalProperties") is False, (
             f"{schema_file.name} root is not additionalProperties:false"
         )
+
+
+def test_raw_model_facing_schemas_are_self_contained():
+    """AF-7 (production blocker) — every RAW (model-emitted) schema uploaded to a
+    model CLI's response_format MUST be self-contained: all ``$ref`` targets must
+    resolve WITHIN the same document (``#/definitions/...``). Cross-file refs
+    (``other.schema.json#/...``) are standard JSON-Schema, but model-API
+    response_format validators (e.g. the codex/OpenAI strict schema validator)
+    do NOT resolve cross-file refs — they reject the schema with
+    'reference can only point to definitions defined at the top level of the
+    schema' (HTTP 400). This blocked the real Codex plan step in Layer 3.
+
+    The RAW schemas are exactly the ones the adapters pass via --output-schema:
+    spec-draft-output, plan-proposal, review-decision."""
+    import json
+    import re
+
+    schemas_dir = Path(__file__).resolve().parents[2] / "schemas"
+    raw_files = ["spec-draft-output.schema.json", "plan-proposal.schema.json",
+                 "review-decision.schema.json"]
+    for name in raw_files:
+        path = schemas_dir / name
+        assert path.exists(), f"RAW schema missing: {name}"
+        text = path.read_text(encoding="utf-8")
+        refs = re.findall(r'"\$ref"\s*:\s*"([^"]+)"', text)
+        cross_file = [r for r in refs if not r.startswith("#")]
+        assert not cross_file, (
+            f"RAW schema {name} has cross-file $ref(s) {cross_file} — model-API "
+            f"response_format validators reject these; inline the definition as "
+            f"#/definitions/<name> so the schema is self-contained."
+        )
+
+
+@pytest.mark.xfail(reason=(
+    "KNOWN v1 blocker (AF-7, 2026-07-31): codex response_format uses STRICT-mode "
+    "structured outputs, which require every object's `required` to list ALL its "
+    "properties (no optional fields). spec-draft-output passes (all-required); "
+    "plan-proposal currently models plan/questions/block_reason as OPTIONAL (a "
+    "union over status) and is rejected with 'required ... Missing plan'. "
+    "Resolving it needs a RAW-schema variant redesign (the engine's wrapper-"
+    "status logic depends on optionality), tracked separately. Marked xfail so "
+    "the gap is visible without blocking the suite."
+))
+def test_raw_plan_schema_is_strict_mode_compliant():
+    """The plan-proposal RAW schema must satisfy codex's strict-mode structured-"
+    "outputs rule: every object's `required` lists ALL its property keys. See the
+    xfail reason — this is the documented, not-yet-resolved Layer-3 blocker."""
+    import json
+    schemas_dir = Path(__file__).resolve().parents[2] / "schemas"
+    schema = json.loads((schemas_dir / "plan-proposal.schema.json")
+                        .read_text(encoding="utf-8"))
+    props = set(schema.get("properties", {}).keys())
+    required = set(schema.get("required", []))
+    assert props <= required, (
+        f"strict mode requires ALL properties in `required`; missing: "
+        f"{props - required}"
+    )

@@ -139,6 +139,25 @@ def test_read_only_flag_present(tmp_path: Path):
     assert diag.get("schema_file", "").endswith("spec-draft-output.schema.json")
 
 
+def test_skip_git_repo_check_flag_present(tmp_path: Path):
+    """AF-7 (production blocker) — CodexAdapter passes ``--skip-git-repo-check``.
+
+    The real Codex CLI (0.146.0) exits 1 with 'Not inside a trusted directory and
+    --skip-git-repo-check was not specified.' when pointed at a repo not in the
+    user's codex trust list. AgentFlow runs codex in a ``-s read-only`` sandbox
+    over a dedicated git worktree branched from the user's already-trusted
+    target_repo, so codex's own trust check is redundant and would block every
+    non-pre-trusted target_repo (and the Layer-3 smoke). The flag is therefore
+    always passed. (No mutation is possible under read-only.)"""
+    _, diag, _, _ = _run_adapter(tmp_path, kind="draft_spec",
+                                 schema_name="spec-draft-output")
+    argv = diag.get("argv", [])
+    assert "--skip-git-repo-check" in argv, (
+        "CodexAdapter must pass --skip-git-repo-check (read-only sandbox makes "
+        "codex's trust check redundant; without it every non-trusted repo fails)"
+    )
+
+
 def test_create_plan_uses_plan_proposal_schema(tmp_path: Path):
     """kind=create_plan routes to the plan-proposal RAW schema (parallel P0-5)."""
     result, diag, _, _ = _run_adapter(

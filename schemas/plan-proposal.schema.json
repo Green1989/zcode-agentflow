@@ -32,6 +32,11 @@
     "block_reason": { "type": "string", "minLength": 1 }
   },
   "definitions": {
+    "taskId": {
+      "type": "string",
+      "pattern": "^T[0-9]{3}(-R[0-9]+)?$",
+      "description": "task id: T000 / T000-R0 form (inlined from spec-envelope so this RAW schema is self-contained — model-API response_format validators do not resolve cross-file $ref)."
+    },
     "rawTask": {
       "type": "object",
       "additionalProperties": false,
@@ -39,7 +44,7 @@
       "required": ["id", "title", "dependencies", "declared_files",
                    "verification_commands", "acceptance_criteria", "planned_changes"],
       "properties": {
-        "id": { "$ref": "spec-envelope.schema.json#/definitions/taskId" },
+        "id": { "$ref": "#/definitions/taskId" },
         "title": { "type": "string", "minLength": 1 },
         "dependencies": {
           "type": "array",

@@ -149,6 +149,41 @@ def _popen_kwargs(cwd) -> dict:
     return kwargs
 
 
+def _resolve_argv0(cmd: list[str], env: dict | None) -> list[str]:
+    """Resolve ``cmd[0]`` to an absolute executable path when needed (AF-7).
+
+    On Windows, ``CreateProcess`` (the backend of ``shell=False`` Popen) does
+    NOT search PATHEXT, so a token list whose first element is a bare command
+    backed by a ``.cmd``/``.bat`` SHIM (e.g. the npm-installed ``codex`` →
+    ``codex.CMD``) raises ``FileNotFoundError [WinError 2]``. ``shutil.which``
+    DOES search PATHEXT (and the ``PATH`` of ``env`` when given), so resolving
+    cmd[0] through it on win32 lets the same safe ``shell=False`` token list find
+    the shim. Non-win32, an absolute path, or an unresolved name is returned
+    unchanged (the OS resolves it).
+
+    Security: this resolves a NAME to a PATH — it never rebuilds a shell string,
+    never touches the remaining argv tokens, and never sets ``shell=True``. The
+    P1-1 ``shell=False`` / no-concatenation invariant is preserved."""
+    if not cmd:
+        return cmd
+    argv0 = cmd[0]
+    # nothing to do for an already-absolute path, or one with a separator, or a
+    # path that already carries an extension (CreateProcess will find it).
+    if (os.path.isabs(argv0) or os.path.sep in argv0
+            or os.path.altsep and os.path.altsep in argv0
+            or os.path.splitext(argv0)[1]):
+        return cmd
+    if sys.platform != "win32":
+        return cmd  # POSIX execvp searches PATH for shell=False token lists
+    import shutil
+    # honor the caller's env PATH when given (tests/controlled environments);
+    # otherwise shutil.which uses the process env.
+    resolved = shutil.which(argv0, path=(env or {}).get("PATH")) if env else shutil.which(argv0)
+    if resolved:
+        return [resolved, *cmd[1:]]
+    return cmd  # unresolved: let CreateProcess raise its own clear error
+
+
 def _write_raw(operation_dir: Path, name: str, content: str) -> None:
     """Write ``content`` to ``operation_dir/raw/<name>`` (UTF-8). The caller has
     already redacted; we just persist."""
@@ -200,8 +235,12 @@ def run_subprocess(
         popen_kwargs = _popen_kwargs(cwd)
         if env is not None:
             popen_kwargs["env"] = env
+        # Windows: resolve a bare command backed by a .cmd/.bat shim (e.g. the
+        # npm-installed codex) to its absolute path — CreateProcess does not
+        # search PATHEXT for shell=False token lists (AF-7 Windows blocker).
+        launch_cmd = _resolve_argv0(cmd, env if env is not None else None)
         proc = subprocess.Popen(
-            cmd,
+            launch_cmd,
             stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
             **popen_kwargs,
         )

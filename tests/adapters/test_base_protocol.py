@@ -85,6 +85,43 @@ def test_run_subprocess_passes_stdin(tmp_path: Path):
     assert "PROMPT-VIA-STDIN" in out
 
 
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="the .cmd-shim resolution is a Windows CreateProcess "
+                           "limitation (PATHEXT not searched with shell=False)")
+def test_run_subprocess_resolves_cmd_shim_on_windows(tmp_path: Path):
+    """AF-7 (Windows production blocker) — on Windows, invoking a command that is
+    a ``.cmd``/``.bat`` SHIM (e.g. the npm-installed ``codex`` → ``codex.CMD``)
+    via a token list with ``shell=False`` must resolve the full path. Otherwise
+    ``CreateProcess`` raises ``FileNotFoundError [WinError 2]`` because it does
+    NOT search PATHEXT for ``shell=False`` token lists.
+
+    This reproduces the real production failure (the Layer-3 smoke failed here:
+    ``CodexAdapter(command="codex")`` → ``FileNotFoundError``). We build a real
+    ``.cmd`` shim on PATH that prints a marker, then call ``run_subprocess`` with
+    the BARE command name (no extension) — it must resolve + run, not raise."""
+    import shutil
+    # build a real .cmd shim in a temp bin dir (mirrors npm's codex.CMD)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    shim = bindir / "afcmd.cmd"
+    shim.write_text("@echo afmarker\n", encoding="utf-8")
+    # put the bin dir on PATH for the child resolution (run_subprocess inherits env)
+    env = dict(os.environ)
+    env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+    op_dir = tmp_path / "op"
+    (op_dir / "raw").mkdir(parents=True)
+
+    # RED before the fix: [WinError 2] because "afcmd" (.cmd) is not found by
+    # CreateProcess without PATHEXT search. GREEN after run_subprocess resolves
+    # cmd[0] via shutil.which on win32.
+    exit_code, out, _ = run_subprocess(
+        ["afcmd"], stdin_text=None, cwd=tmp_path, timeout=30,
+        operation_dir=op_dir, env=env,
+    )
+    assert exit_code == 0
+    assert "afmarker" in out
+
+
 def test_run_subprocess_nonzero_exit_returned(tmp_path: Path):
     op_dir = tmp_path / "op"
     (op_dir / "raw").mkdir(parents=True)

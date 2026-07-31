@@ -253,8 +253,23 @@ def run_smoke() -> dict:
         st = store.State.load(control)
         draft = eng.planner_draft_spec(goal=goal, expected_revision=st.revision)
         _log(f"draft ok: status={draft['status']} (real codex)")
+        # If Codex asks clarifying questions, re-enter ONCE with a "proceed with
+        # defaults" answer (the harness stands in for the operator here; a human
+        # would answer for real). If it STILL asks, stop safely (NEEDS_USER_INPUT).
         if draft["status"] == "NEEDS_USER_INPUT":
-            _log("Codex asked questions; re-run with answers — stopping safely.")
+            _log(f"Codex asked {len(draft.get('questions', []))} question(s); "
+                 "re-entering with 'proceed with sensible defaults'.")
+            eng = _build_engine(control, worktree, repo, plugin, user_data)
+            st = store.State.load(control)
+            draft = eng.planner_draft_spec(
+                goal=goal,
+                answers="Proceed with sensible defaults for any open question; "
+                        "keep the change minimal and to a single file.",
+                expected_revision=st.revision,
+            )
+            _log(f"draft re-entry ok: status={draft['status']} (real codex)")
+        if draft["status"] == "NEEDS_USER_INPUT":
+            _log("Codex still asks questions after re-entry; stopping safely.")
             return {"outcome": "NEEDS_USER_INPUT", "questions": draft["questions"]}
 
         # 3. approve (HUMAN GATE 1: recorded with configured confirmation)
