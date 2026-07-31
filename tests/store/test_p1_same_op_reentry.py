@@ -132,6 +132,51 @@ def test_same_operation_id_active_reentry_is_idempotent(tmp_path: Path):
     assert st.active_operation_id == op_id
 
 
+def test_same_operation_id_active_reentry_rejects_different_request(
+    tmp_path: Path,
+):
+    """An active same-id re-entry is idempotent only for the SAME request.
+
+    The re-entry path must retain ``OperationManager.prepare``'s request-hash
+    conflict check.  Reusing an operation id for different input must not get a
+    fresh lease or overwrite the operation's original intent.
+    """
+    control = tmp_path / "control"
+    control.mkdir()
+    _seed(control)
+    s = store.Store(control)
+    op_id = "run__planner_draft_spec__r1__a1"
+    request_a = {"tool": "planner_draft_spec", "args": {"goal": "A"}}
+    request_b = {"tool": "planner_draft_spec", "args": {"goal": "B"}}
+
+    br = s.begin_operation(
+        operation_id=op_id,
+        request=request_a,
+        tool="planner_draft_spec",
+        expected_revision=store.State.load(control).revision,
+        intermediate_state="DRAFTING_SPEC",
+        replay_policy="COSTFUL_READ",
+    )
+    before = store.State.load(control)
+
+    with pytest.raises(store.OperationConflict):
+        s.begin_operation(
+            operation_id=op_id,
+            request=request_b,
+            tool="planner_draft_spec",
+            expected_revision=before.revision,
+            intermediate_state="DRAFTING_SPEC",
+            replay_policy="COSTFUL_READ",
+        )
+
+    after = store.State.load(control)
+    assert after.revision == before.revision
+    assert after.active_operation_id == op_id
+    # The original lease remains valid because the conflicting retry did not
+    # reach the lease reissue branch.
+    assert after.active_operation_lease == s._hash_lease(br.lease_token)
+
+
 def test_same_operation_id_reentry_after_midexternal_crash_current_behavior(
     tmp_path: Path,
 ):

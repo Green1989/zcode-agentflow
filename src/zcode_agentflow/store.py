@@ -520,7 +520,16 @@ class Store:
                         f"re-entry expected_revision {expected_revision} != "
                         f"current {state.revision} (run {state.run_id!r})"
                     )
-                op = OperationManager(self.control_root).open_existing(operation_id)
+                # Reuse the normal prepare path so an active same-id retry is
+                # idempotent only for the original request.  ``prepare``
+                # returns the existing operation for an identical request and
+                # raises OperationConflict for a different request; the latter
+                # must not receive a fresh lease.
+                op = OperationManager(self.control_root).prepare(
+                    operation_id=operation_id,
+                    request=request,
+                    replay_policy=replay_policy,
+                )
                 lease_token = secrets.token_urlsafe(32)
                 state.active_operation_lease = self._hash_lease(lease_token)
                 state.save(self.control_root)
