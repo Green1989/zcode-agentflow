@@ -222,6 +222,53 @@ def test_recover_roll_forward_when_state_json_not_yet_replaced(tmp_path: Path, m
     )
 
 
+def test_roll_forward_copies_all_authoritative_sha_fields(tmp_path: Path, monkeypatch):
+    """Follow-up to P0-1 Case C (found in read-only recheck): when recover rolls
+    the run state forward from a durable FINISH event whose snapshot was NOT yet
+    mirrored into state.json, it must copy EVERY authoritative field the finish
+    folded into the committed snapshot — including spec_sha256 / plan_sha256 /
+    task_manifest_sha256. prepare_generation fills all five NAME_TO_STATE_SHA
+    fields; if Case C only copies artifact_generation + the two *_result shas,
+    the rolled-forward state points at the NEW generation but keeps the OLD
+    spec/plan/manifest shas, breaking the 'state authoritative sha == blob sha
+    of the generation the state points at' invariant.
+    """
+    from zcode_agentflow import artifacts as _artifacts
+
+    control = tmp_path / "control"
+    control.mkdir()
+    _seed(control)
+    s = store.Store(control)
+
+    br = _begin(s)
+    staged = {"SPEC.md": b"# Spec body\n"}
+
+    # Crash AFTER the finish event append but BEFORE the state.json replace.
+    monkeypatch.setenv("AGENTFLOW_CRASH_AFTER", "finish_after_event")
+    with pytest.raises(store.CrashInjected):
+        s.finish_operation(
+            operation_id=br.operation_id,
+            lease_token=br.lease_token,
+            expected_revision=br.revision_after_begin,
+            next_state="READY_FOR_SPEC_APPROVAL",
+            staged_artifacts=staged,
+            result={"ok": True},
+        )
+
+    fresh = store.Store(control)
+    recovered = fresh.recover()
+    # the rolled-forward state points at the NEW generation that staged SPEC.md
+    gen = _artifacts.load_generation(control, recovered.artifact_generation)
+    expected_spec_sha = gen.index["SPEC.md"]["sha256"]
+    # the state's authoritative spec_sha256 must equal that blob's sha, not the
+    # pre-finish (None / old) value Case C would leave behind.
+    assert recovered.spec_sha256 == expected_spec_sha, (
+        f"roll-forward left spec_sha256={recovered.spec_sha256!r} while the "
+        f"committed generation's SPEC blob sha is {expected_spec_sha!r} — Case C "
+        f"must copy all authoritative sha fields, not just artifact_generation"
+    )
+
+
 def _all_events(control: Path) -> list[dict]:
     path = control / "events.jsonl"
     if not path.exists():

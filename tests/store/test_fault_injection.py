@@ -398,4 +398,3 @@ def test_external_boundary_begin_committed_finish_never_started(tmp_path, crash_
     # the orphan is classified: COSTFUL_READ with no result => NEEDS_HUMAN
     assert recovered.active_operation_id is None
     assert recovered.state in ("DRAFTING_SPEC", "NEEDS_HUMAN")
-

@@ -944,6 +944,15 @@ class Store:
             state.active_operation_id = rolled.active_operation_id
             state.active_operation_lease = rolled.active_operation_lease
             state.artifact_generation = rolled.artifact_generation
+            # ALL authoritative artifact shas the finish folded into its snapshot
+            # (prepare_generation fills the full NAME_TO_STATE_SHA set). Copying
+            # only artifact_generation + the two *_result shas would leave the
+            # rolled-forward state pointing at the NEW generation but carrying the
+            # OLD spec/plan/manifest shas, breaking the
+            # 'state sha == blob sha of the pointed generation' invariant.
+            state.spec_sha256 = rolled.spec_sha256
+            state.plan_sha256 = rolled.plan_sha256
+            state.task_manifest_sha256 = rolled.task_manifest_sha256
             state.execution_result_sha256 = rolled.execution_result_sha256
             state.review_result_sha256 = rolled.review_result_sha256
             # authoritative fields the finish folded into its commit (P0-2):

@@ -173,12 +173,12 @@ def test_review_bundle_does_not_mask_blob_corruption(tmp_path: Path, monkeypatch
     ref = resolver._ref("execution-result.json")
     (control / ref["blob"]).write_bytes(b'{"ok": "TAMPERED"}\n')
 
-    # build_review_bundle must propagate the integrity failure (raise), NOT
-    # silently fall back to the caller-supplied exec_result.
-    with pytest.raises(Exception):
-        review_bundle.build_review_bundle(
-            control_root=control,
+    # assemble must propagate the integrity failure (raise), NOT silently fall
+    # back to the caller-supplied exec_result.
+    with pytest.raises(artifacts.ArtifactCorrupt):
+        review_bundle.assemble(
             operation_dir=op_dir,
+            resolver=resolver,
             run_worktree_root=control / "wt",
             base_commit="deadbeef",
             head_commit="feedface",
