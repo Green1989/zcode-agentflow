@@ -1,0 +1,43 @@
+# AgentFlow notes
+
+> This section is appended by ZCode-AgentFlow to the resolved agent context
+> (`control_root/resolved-agent-context.md`); it is NEVER written into the
+> repository's own `AGENTS.md`. It is **context only** — guidance for the
+> planning/review models — and is NOT a security allowlist.
+
+## Verification command shape (v1)
+
+Each task declares structured verification commands (never free-form shell
+strings):
+
+```json
+{ "program": "pytest", "args": ["-q"], "cwd": ".", "timeout_sec": 120 }
+```
+
+A command has one of three `kind`s, governed by two DISTINCT structured
+allowlists from `config.yaml` (`verification.program_allowlist` /
+`interpreter_allowlist`):
+
+- `executable`     — the `program` itself must be in `program_allowlist`.
+- `cmd_script`     — a `.bat`/`.cmd` script path inside the worktree, run via
+                     `cmd.exe`; the interpreter must be in `interpreter_allowlist`.
+- `bash_script`    — a `.sh` script path inside the worktree, run via `bash`;
+                     the interpreter must be in `interpreter_allowlist`.
+
+If a script kind is not supported in the current version, the schema/config
+**explicitly rejects** it rather than claiming support. Unsafe metacharacters
+(`& | < > ^ % !`) in program/args are rejected; the program+args are always
+passed to `subprocess` as a list (never concatenated into one string).
+
+## v1 scope: single task per run
+
+A v1 plan carries **exactly one task**. A multi-task goal is rejected at plan
+validation (the planner-result wrapper surfaces `NEEDS_USER_INPUT` / `BLOCKED`),
+never silently truncated to `tasks[0]`.
+
+## Allowlists are config, not Markdown
+
+The security source for verification is the structured `program_allowlist` /
+`interpreter_allowlist` in `config.yaml`. This file (and any repo `AGENTS.md`)
+is **context only** — never parsed into an executable allowlist, never trusted
+as a security boundary.
