@@ -591,9 +591,15 @@ class Store:
     def finish_operation(self, *, operation_id, lease_token, expected_revision,
                          next_state, staged_artifacts, result) -> dict:
         """Re-take the per-Run lock, verify op + lease + revision_after_begin,
-        write the result + the next state_after snapshot, append the finish
-        event, and perform the SINGLE ``os.replace(state.json)`` that commits
-        the transition. Then mark the op COMMITTED and clear the active op.
+        write the result + the next state_after snapshot, append+fsync the
+        finish event, and THEN perform the SINGLE ``os.replace(state.json)``
+        that commits the transition. Then mark the op COMMITTED.
+
+        Commit order (Spec §3.5 写入顺序 + Plan Task 3.4, P0-1 fix): the durable
+        finish event is appended BEFORE the state.json replace, so a crash in
+        the window between them (or a later state.json corruption) can still
+        reconstruct the committed state from the event's sha-verified snapshot
+        (recover's Case C rolls forward).
 
         ``staged_artifacts`` (a {logical_name: bytes} map) is consumed by
         :func:`artifacts.prepare_generation` (Task 3.5): it writes blobs + the
@@ -648,9 +654,13 @@ class Store:
                 "state_after_finish", state.to_dict()
             )
             _crash_checkpoint("finish_after_snapshot")
-            # THE ONLY COMMIT POINT: single os.replace(state.json).
-            state.save(self.control_root)
-            _crash_checkpoint("finish_after_state_replace")
+            # Commit protocol (Spec §3.5 写入顺序 + Plan Task 3.4 pseudocode):
+            # the recoverable FINISH event (with its sha-verified state_after
+            # snapshot) is appended+fsync'd BEFORE the single state.json
+            # replace. Reversing this leaves a crash window where state.json is
+            # advanced but only the BEGIN event is durable; a later state.json
+            # corruption then loses the committed transition + artifact pointer
+            # (P0-1, reviewer window).
             EventLog(self.control_root).append(
                 operation_id=operation_id,
                 from_state=pre_state,
@@ -661,6 +671,11 @@ class Store:
                 revision=state.revision,
             )
             _crash_checkpoint("finish_after_event")
+            # THE ONLY COMMIT POINT: single os.replace(state.json). The event
+            # above is already durable, so a crash here (or a later state.json
+            # corruption) can still reconstruct the committed state from it.
+            state.save(self.control_root)
+            _crash_checkpoint("finish_after_state_replace")
             op.mark_committed()
             return {
                 "operation_id": operation_id,
@@ -690,7 +705,10 @@ class Store:
             snap_rel, snap_sha = op.write_state_snapshot(
                 "state_after_fail", state.to_dict()
             )
-            state.save(self.control_root)
+            # Fail path uses the SAME commit order as finish (P0-1): the
+            # recoverable event is appended+fsync'd BEFORE the state.json
+            # replace, so a crash here (or a later state.json corruption) can
+            # still reconstruct the NEEDS_HUMAN transition from the event.
             EventLog(self.control_root).append(
                 operation_id=operation_id,
                 from_state=pre_state,
@@ -700,6 +718,8 @@ class Store:
                 state_after_sha=snap_sha,
                 revision=state.revision,
             )
+            _crash_checkpoint("fail_after_event")
+            state.save(self.control_root)
             op.mark_failed()
             return {
                 "operation_id": operation_id,
@@ -883,6 +903,35 @@ class Store:
         # state has no active op AND this begin's op is RUNNING with a result,
         # the finish committed — reconcile.
         if snap_active == op_id and state.active_operation_id is None and op.has_result():
+            op.mark_committed()
+            return
+
+        # Case C (P0-1 order fix): the latest event is a FINISH (snap_active is
+        # None — a finish clears the active op in its snapshot) whose snapshot
+        # sha DIFFERS from the current state.json. With the corrected commit
+        # order (event appended BEFORE the state.json replace), this means the
+        # process crashed AFTER appending the durable finish event but BEFORE
+        # replacing state.json. The current state.json still shows the
+        # intermediate state with an active op set, but the FINISH event already
+        # carries the authoritative committed state (sha-verified snapshot). Roll
+        # the run state FORWARD from that snapshot and mark the op COMMITTED —
+        # do NOT classify the orphan as UNKNOWN/NEEDS_HUMAN (the transition did
+        # commit; only the state.json mirror lagged).
+        if snap_active is None and op.has_result():
+            rolled = State.from_dict(snap)
+            # mutate the in-memory state the caller is reconciling, in place,
+            # so recover()'s subsequent steps (orphan classification, persistence)
+            # see the rolled-forward view. The snapshot already reflects the
+            # committed transition (state advanced, active op cleared, artifact
+            # pointer set), so every relevant field is copied.
+            state.state = rolled.state
+            state.previous_state = rolled.previous_state
+            state.revision = rolled.revision
+            state.active_operation_id = rolled.active_operation_id
+            state.active_operation_lease = rolled.active_operation_lease
+            state.artifact_generation = rolled.artifact_generation
+            state.execution_result_sha256 = rolled.execution_result_sha256
+            state.review_result_sha256 = rolled.review_result_sha256
             op.mark_committed()
 
     def _load_or_rebuild_state(self) -> State:
