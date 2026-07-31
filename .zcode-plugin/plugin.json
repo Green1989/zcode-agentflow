@@ -11,8 +11,9 @@
         "zcode_agentflow.server"
       ],
       "env": {
-        "AGENTFLOW_CONFIG": "${ZCODE_PROJECT_DIR}/config.yaml",
-        "AGENTFLOW_CAPABILITIES": "${ZCODE_PROJECT_DIR}/docs/capabilities.json"
+        "ZCODE_PLUGIN_ROOT": "${ZCODE_PLUGIN_ROOT}",
+        "AGENTFLOW_CONFIG": "${ZCODE_PLUGIN_ROOT}/config.yaml",
+        "AGENTFLOW_CAPABILITIES": "${ZCODE_PLUGIN_ROOT}/docs/capabilities.json"
       }
     }
   },

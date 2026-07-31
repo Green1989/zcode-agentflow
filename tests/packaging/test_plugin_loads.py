@@ -201,3 +201,76 @@ def test_manifest_advertises_exactly_nine_mcp_tools():
     server_names = list(m.get("mcpServers", {}).keys())
     assert all("abandon" not in n and "archive" not in n for n in server_names), \
         "abandon/archive must not be registered as MCP servers/tools"
+
+
+# ===========================================================================
+# AF-5 (audit-fix) — the manifest wires the PRODUCTION context env, and that
+# env actually resolves a RunContext (closes the "test only parses JSON" gap;
+# P0-2 root cause was that the manifest set AGENTFLOW_CONFIG/_CAPABILITIES but
+# nothing read them, and ZCODE_PLUGIN_ROOT was absent).
+# ===========================================================================
+
+
+def test_manifest_env_wires_production_context():
+    """The mcpServers env must set ZCODE_PLUGIN_ROOT (so bootstrap.process_config
+    can resolve the plugin root) AND point AGENTFLOW_CONFIG/AGENTFLOW_CAPABILITIES
+    at files inside the PLUGIN root (config.yaml + docs/capabilities.json ship
+    WITH the plugin — they are not per-project). Pointing them at
+    ${ZCODE_PROJECT_DIR} would require every target repo to carry AgentFlow's
+    config, breaking the cross-project user-level plugin model (Spec §6: config
+    lives at plugin_root)."""
+    m = _load_plugin()
+    entry = next(iter(m["mcpServers"].values()))
+    env = entry.get("env", {})
+    assert isinstance(env, dict)
+    # ZCODE_PLUGIN_ROOT is expanded by the plugin host (capabilities.json
+    # manifest_fields.plugin_manifest); the server reads it via process_config.
+    assert env.get("ZCODE_PLUGIN_ROOT") == "${ZCODE_PLUGIN_ROOT}", (
+        "manifest must set ZCODE_PLUGIN_ROOT so process_config() can resolve "
+        "the production run context (P0-2 fix)"
+    )
+    # config + capabilities ship with the plugin (PLUGIN root), not per-project.
+    assert env["AGENTFLOW_CONFIG"] == "${ZCODE_PLUGIN_ROOT}/config.yaml", (
+        "config.yaml ships with the plugin (Spec §6); must point at the plugin "
+        "root, not ${ZCODE_PROJECT_DIR}"
+    )
+    assert env["AGENTFLOW_CAPABILITIES"] == "${ZCODE_PLUGIN_ROOT}/docs/capabilities.json", (
+        "capabilities.json ships with the plugin; must point at the plugin root"
+    )
+
+
+def test_manifest_env_actually_resolves_run_context(tmp_path, monkeypatch):
+    """The env the manifest resolves, when expanded by the host and set on a real
+    process, makes bootstrap.process_config() build a non-None RunContext. This
+    is more than JSON parsing: it proves the manifest's env wiring is sufficient
+    for the production context path (the gap behind P0-2).
+
+    The host expands ${ZCODE_PLUGIN_ROOT} -> an absolute dir; we simulate that by
+    using the repo itself as the plugin root (it contains config.yaml +
+    docs/capabilities.json, exactly as an installed plugin would)."""
+    from zcode_agentflow import bootstrap
+
+    # a config that opts into the fallback so the capability gate resolves
+    # (tool_confirmation=false in this env; the shipped config.yaml has the
+    # switch false -> G6 fail-loud. Resolution-path coverage, not gate coverage.)
+    import yaml
+    cfg = yaml.safe_load((REPO / "config.yaml").read_text(encoding="utf-8"))
+    cfg["human_gates"]["spec_approval"]["allow_non_adversarial_fallback"] = True
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+
+    # simulate the host-expanded env: plugin root = repo (ships config + caps),
+    # user_data_root = a temp dir.
+    for var in ("ZCODE_PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT", "AGENTFLOW_RUN_CONTEXT",
+                "AGENTFLOW_TEST_MODE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("ZCODE_PLUGIN_ROOT", str(REPO))
+    monkeypatch.setenv("AGENTFLOW_USER_DATA_ROOT", str(tmp_path / "ud"))
+    monkeypatch.setenv("AGENTFLOW_CONFIG", str(cfg_path))
+    monkeypatch.setenv("AGENTFLOW_CAPABILITIES",
+                       str(REPO / "docs" / "capabilities.json"))
+
+    ctx = bootstrap.process_config()
+    assert isinstance(ctx, bootstrap.RunContext)
+    assert ctx.plugin_root == REPO.resolve()
+    assert "effective_approval_mode" in ctx.effective_config
