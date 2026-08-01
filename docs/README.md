@@ -28,6 +28,29 @@ Verify the installed versions match the spike freeze:
 python -c "import mcp, portalocker, jsonschema, yaml; print('mcp', mcp.__version__)"
 ```
 
+### Install as a ZCode plugin (local marketplace)
+
+This repo ships a minimal `marketplace.json` at the root so ZCode's Discover
+flow can add it as a **local marketplace** and install the plugin. The
+marketplace root *is* the plugin root (`plugins[].source == "."`), so no
+`pluginRoot` or absolute path is needed.
+
+1. **Settings → Plugin Management → Discover → `+`** → choose **Local
+   directory/file** → select **this repo's root directory** (or the
+   `marketplace.json` file directly).
+2. The `zcode-agentflow` card appears in the marketplace → click
+   **Get / Install** → it moves to **Installed**.
+3. On the **Installed** tab, confirm the plugin is **Enabled** (new plugins are
+   enabled by default). Open its detail view to verify the components resolve:
+   **MCP** (the `zcode-agentflow` stdio server), **Skill** (`agentflow`),
+   **Commands** (`agentflow-start`, `agentflow-status`), and **Hooks**.
+4. **Start a new session.** The 9 `workflow_*` / `planner_*` / `reviewer_*`
+   MCP tools (including `workflow_status`) become available.
+
+> The plugin is installed/enabled by you in the ZCode UI; this repo only ships
+> the manifest + marketplace files. The supervisor never auto-merges — see the
+> run loop in §3.
+
 ### External dependencies (the real CLIs)
 
 AgentFlow shells out to two CLIs (Phase 0 marked both as **required** gates):

@@ -1,0 +1,13 @@
+{
+  "name": "zcode-agentflow-local",
+  "version": 1,
+  "description": "Local development marketplace for ZCode-AgentFlow.",
+  "plugins": [
+    {
+      "name": "zcode-agentflow",
+      "source": ".",
+      "version": "0.1.0",
+      "description": "ZCode-supervised AgentFlow using Codex planner and Grok reviewer."
+    }
+  ]
+}

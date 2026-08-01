@@ -274,3 +274,136 @@ def test_manifest_env_actually_resolves_run_context(tmp_path, monkeypatch):
     assert isinstance(ctx, bootstrap.RunContext)
     assert ctx.plugin_root == REPO.resolve()
     assert "effective_approval_mode" in ctx.effective_config
+
+
+# ===========================================================================
+# Phase 7 packaging gap — local ZCode marketplace
+#
+# ZCode's Discover → "+" adds a *marketplace* (it expects a marketplace.json at
+# the root), not a bare plugin directory. A plugin dir carrying only
+# .zcode-plugin/plugin.json is therefore not installable through the UI until a
+# minimal marketplace.json lists it. This pins the contract the shipped
+# marketplace.json must satisfy so the plugin is discoverable as a local dev
+# marketplace (no absolute paths, no directory/filesystem source objects).
+# ===========================================================================
+
+
+MARKETPLACE = REPO / "marketplace.json"
+
+
+def _load_marketplace() -> dict:
+    assert MARKETPLACE.exists(), f"marketplace.json missing at {MARKETPLACE}"
+    return json.loads(MARKETPLACE.read_text(encoding="utf-8"))
+
+
+def test_marketplace_exists_and_parses():
+    """A local marketplace.json ships at the repo root so ZCode's Discover "+"
+    can add this repo as a local marketplace (a bare plugin dir is not enough)."""
+    assert MARKETPLACE.exists(), (
+        "marketplace.json must ship at the repo root — ZCode Discover '+' adds a "
+        "marketplace, not a bare plugin directory"
+    )
+    m = _load_marketplace()
+    assert isinstance(m, dict), "marketplace.json must be a JSON object"
+
+
+def test_marketplace_top_level_name_and_version():
+    """name pins the marketplace identity; version is the documented integer 1."""
+    m = _load_marketplace()
+    assert m.get("name") == "zcode-agentflow-local", (
+        "marketplace name must be 'zcode-agentflow-local'"
+    )
+    assert m.get("version") == 1, "marketplace version must be the integer 1"
+
+
+def test_marketplace_lists_exactly_the_agentflow_plugin():
+    """plugins must contain exactly zcode-agentflow and nothing else."""
+    m = _load_marketplace()
+    plugins = m.get("plugins")
+    assert isinstance(plugins, list), "plugins must be a list"
+    names = [p.get("name") for p in plugins]
+    assert names == ["zcode-agentflow"], (
+        f"plugins must be exactly ['zcode-agentflow']; got {names}"
+    )
+
+
+def test_marketplace_plugin_version_matches_manifest():
+    """The marketplace plugin version must agree with .zcode-plugin/plugin.json
+    (a drift would make the marketplace advertise a non-existent version)."""
+    m = _load_marketplace()
+    plugin = m["plugins"][0]
+    manifest = _load_plugin()
+    assert plugin.get("version") == manifest.get("version"), (
+        f"marketplace plugin version {plugin.get('version')!r} must equal the "
+        f"manifest version {manifest.get('version')!r}"
+    )
+
+
+def test_marketplace_source_is_relative_dot():
+    """source is the relative path '.' — the marketplace root itself is the
+    plugin root (no directory/filesystem source object, no pluginRoot)."""
+    m = _load_marketplace()
+    plugin = m["plugins"][0]
+    source = plugin.get("source")
+    assert source == ".", (
+        f"plugin source must be the relative path '.' (marketplace root == plugin "
+        f"root); got {source!r}"
+    )
+    # must NOT be a directory/filesystem source OBJECT (per packaging decision)
+    assert not isinstance(source, dict), (
+        "source must be a plain relative-path string, not a source object"
+    )
+    # pluginRoot is intentionally absent — '.' already points at the repo root
+    assert "pluginRoot" not in m, (
+        "pluginRoot must not be set — '.' already resolves to the marketplace root"
+    )
+
+
+def test_marketplace_source_resolves_to_plugin_manifest():
+    """The resolved source '.' must contain .zcode-plugin/plugin.json, i.e. the
+    marketplace root genuinely is a valid plugin root."""
+    m = _load_marketplace()
+    plugin_root = REPO / plugin_source_path(m["plugins"][0])
+    assert (plugin_root / ".zcode-plugin" / "plugin.json").exists(), (
+        f"resolved plugin root {plugin_root} must contain "
+        f".zcode-plugin/plugin.json"
+    )
+
+
+def test_marketplace_contains_no_absolute_paths():
+    """No host-specific absolute paths may appear anywhere in marketplace.json —
+    it must stay portable (source is the relative '.')."""
+    text = MARKETPLACE.read_text(encoding="utf-8")
+    # re-parse and walk values so assertions are on actual data, not formatting
+    m = _load_marketplace()
+
+    def _walk(obj):
+        if isinstance(obj, dict):
+            yield from obj.keys()
+            for v in obj.values():
+                yield from _walk(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                yield from _walk(v)
+        else:
+            yield obj
+
+    for value in _walk(m):
+        assert not (isinstance(value, str) and (
+            # Windows drive letter (e.g. C:\) or Posix absolute (/...)
+            re.match(r"^[A-Za-z]:[\\/]", value) or value.startswith("/")
+        )), f"marketplace.json must not contain an absolute path: {value!r} (in {text!r})"
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+
+def plugin_source_path(plugin_entry: dict) -> str:
+    """The plugin source as a path string (relative-path source form only)."""
+    source = plugin_entry["source"]
+    assert isinstance(source, str), (
+        "this marketplace contract only permits a relative-path source string"
+    )
+    return source
