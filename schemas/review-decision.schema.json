@@ -1,6 +1,5 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "review-decision.schema.json",
   "title": "review-decision (RAW, model-emitted)",
   "description": "What Grok emits from reviewer_review_task. RAW: FORBIDS authoritative fields (run_id, task_id, base_commit, head_commit, hashes, plan_version) — the engine injects those into the FINAL review-result. Only the decision + the review substance. Cross-field invariants (decision/issues/replan consistency) are enforced by validate_raw_review. (Task 2.1, parallel P0-4.)",
   "type": "object",

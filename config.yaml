@@ -59,6 +59,16 @@ reviewer:
   output_format: json
   sandbox: read-only            # must resolve to the real flags for the installed CLI
   timeout_sec: 300
+  # Grok has NO automatic proxy injection (unlike codex's ~/.codex/.env).
+  # The grok adapter (adapters/grok.py) reads reviewer.proxy and injects these
+  # into the subprocess env. Without this, grok HANGS indefinitely (network
+  # unreachable) and the review times out at 300s -> FAILED -> NEEDS_HUMAN.
+  # This is the AUTHORITATIVE proxy config for the reviewer; do not rely on
+  # plugin.json env inheritance (fragile across reinstalls).
+  proxy:
+    HTTPS_PROXY: http://127.0.0.1:7897
+    HTTP_PROXY: http://127.0.0.1:7897
+    ALL_PROXY: http://127.0.0.1:7897
 
 verification:                   # layer 1: verification command policy
   command_policy:

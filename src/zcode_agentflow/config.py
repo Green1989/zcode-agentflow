@@ -123,6 +123,21 @@ CONFIG_SCHEMA = {
                 "output_format": {"type": "string"},
                 "sandbox": {"type": "string"},
                 "timeout_sec": {"type": "integer", "minimum": 1},
+                # proxy: Grok has NO automatic proxy injection (unlike codex's
+                # ~/.codex/.env). engine.py passes reviewer.proxy into the grok
+                # adapter request, which injects HTTPS_PROXY/HTTP_PROXY/ALL_PROXY
+                # into the subprocess env. Without this, grok HANGS indefinitely
+                # on network-unreachable. This is the authoritative place to
+                # configure the proxy (config.yaml reviewer.proxy), not plugin.json.
+                "proxy": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "HTTPS_PROXY": {"type": "string"},
+                        "HTTP_PROXY": {"type": "string"},
+                        "ALL_PROXY": {"type": "string"},
+                    },
+                },
             },
         },
         "verification": {

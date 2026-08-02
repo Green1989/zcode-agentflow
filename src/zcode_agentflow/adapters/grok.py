@@ -102,7 +102,25 @@ class GrokAdapter:
         executable = request.get("executable")
         if executable:
             argv.append(str(executable))
-        argv += ["-p", "Review the task change against the Review Bundle files."]
+        # Inline the Review Bundle file contents directly into the -p prompt.
+        # Rationale: grok in some subprocess environments (e.g. an MCP server
+        # spawned by a GUI host, which has no TERM) does not perform multi-turn
+        # tool calls to read files via --cwd, so it would decide BLOCKED without
+        # ever seeing the bundle. Inlining the bundle into the single-turn prompt
+        # makes the review deterministic regardless of the tool-call capability.
+        bundle_files = ["SPEC.md", "PLAN.md", "task-manifest.json",
+                        "execution-result.json", "diff.patch"]
+        prompt_parts = [
+            "Review the task change against the Review Bundle below. Read the "
+            "inlined files and decide PASS/FAIL/REPLAN/BLOCKED per the "
+            "review-decision schema.",
+        ]
+        for name in bundle_files:
+            fp = Path(bundle_dir) / name
+            if fp.is_file():
+                prompt_parts.append(f"\n\n===== {name} =====\n"
+                                    + fp.read_text(encoding="utf-8"))
+        argv += ["-p", "".join(prompt_parts)]
         # G8: --cwd is an ABSOLUTE path to the bundle dir.
         argv += ["--cwd", str(bundle_dir)]
         # G8: --json-schema takes INLINE JSON (read the file, pass its contents).
