@@ -219,3 +219,36 @@ def test_network_policy_is_advisory_or_absent(tmp_path: Path):
         network_policy=NetworkPolicy.ADVISORY_ONLY,
     )
     assert result["exit_code"] == 0
+
+
+# ---------------------------------------------------------------------------
+# P1-5: verification must not pollute the worktree with __pycache__/*.pyc
+# ---------------------------------------------------------------------------
+
+
+def test_verification_does_not_pollute_worktree(tmp_path: Path):
+    """P1-5 regression: running ``python -m py_compile <file>.py`` must NOT leave
+    a ``__pycache__/`` (or any ``.pyc``) in the worktree. Previously the
+    verification subprocess inherited the parent env, so py_compile wrote
+    bytecode into the worktree; the reviewer's clean-tree check then routed the
+    run to the terminal NEEDS_HUMAN state. The fix sets
+    PYTHONDONTWRITEBYTECODE=1 (and redirects PYTHONPYCACHEPREFIX outside the
+    worktree as a backstop) in the verification child env."""
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / "module.py").write_text("ANSWER = 42\n", encoding="utf-8")
+
+    result = run_verification(
+        command={"kind": "executable", "program": sys.executable,
+                 "args": ["-m", "py_compile", "module.py"],
+                 "cwd": ".", "timeout_sec": 30},
+        worktree_root=worktree,
+        program_allowlist=[sys.executable, "python"],
+        interpreter_allowlist=["cmd.exe", "bash"],
+    )
+
+    assert result["exit_code"] == 0, result["stderr"]
+    # no bytecode artifacts of any kind in the worktree
+    assert not (worktree / "__pycache__").exists()
+    assert not list(worktree.rglob("*.pyc"))
+

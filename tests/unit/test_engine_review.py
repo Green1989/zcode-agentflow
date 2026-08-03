@@ -256,6 +256,28 @@ def test_head_bound_to_execution_result_before_review(tmp_path):
     assert after.state == "NEEDS_HUMAN"
 
 
+# ---------- 5b. dirty worktree at review time lists the offending files -----
+
+
+def test_review_dirty_tree_error_lists_files(tmp_path):
+    """P1-5 DX: when the worktree is dirty at review time, the WorkflowError must
+    name the offending files (not just say 'not clean'), so an operator can tell
+    a stray ``__pycache__/`` (verifier artifact) from a real uncommitted change
+    without digging into the operation record. Routing to NEEDS_HUMAN is
+    unchanged."""
+    repo, wt, control, base, head, _ = _make_repo_verified(tmp_path)
+    grok = FakeGrok(decision=_pass_decision())
+    eng = _engine(control, repo, wt, grok=grok, plugin_root=_plugin_root(tmp_path))
+    # leave an uncommitted stray file in the worktree (no add/commit)
+    (Path(wt) / "stray.txt").write_text("oops\n", encoding="utf-8")
+
+    st = store.State.load(control)
+    with pytest.raises(engine.WorkflowError, match="stray.txt"):
+        eng.reviewer_review_task(task_id="T001", expected_revision=st.revision)
+    after = store.State.load(control)
+    assert after.state == "NEEDS_HUMAN"
+
+
 # ---------- 6. last_reviewed_commit set AFTER review (consistency #3) --------
 
 

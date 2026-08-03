@@ -817,8 +817,11 @@ class Engine:
                 )
             # worktree must be clean at review time (GrokAdapter re-checks too).
             if not gitops.is_clean(wt):
+                untracked = gitops.untracked_files(wt)
+                detail = ", ".join(untracked) if untracked else "tracked/staged changes"
                 raise WorkflowError(
-                    "worktree not clean at review time; route to NEEDS_HUMAN"
+                    f"worktree not clean at review time (untracked or modified: "
+                    f"{detail}); route to NEEDS_HUMAN"
                 )
 
             # read the task + assemble the immutable Review Bundle (read-only).

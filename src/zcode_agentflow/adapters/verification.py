@@ -39,6 +39,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from enum import Enum
 from pathlib import Path
 
@@ -337,12 +338,24 @@ def run_verification(
             f"is never accepted)"
         )
 
+    # P1-5: keep the worktree clean. Verification commands (py_compile, pytest,
+    # etc.) must not leave __pycache__/*.pyc behind in the worktree — the
+    # reviewer's clean-tree check would otherwise route the run to NEEDS_HUMAN.
+    # Don't write bytecode at all; as a backstop, redirect the pycache dir
+    # outside the worktree so any child that clears the flag still can't pollute.
+    child_env = dict(os.environ)
+    child_env["PYTHONDONTWRITEBYTECODE"] = "1"
+    child_env.setdefault(
+        "PYTHONPYCACHEPREFIX",
+        str(Path(tempfile.gettempdir()) / "agentflow-pycache"),
+    )
     exit_code, stdout, stderr = run_subprocess(
         argv,
         stdin_text=None,
         cwd=cwd,
         timeout=cmd_timeout,
         operation_dir=operation_dir,
+        env=child_env,
     )
     return {
         "exit_code": exit_code,
