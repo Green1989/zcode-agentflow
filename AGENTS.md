@@ -8,7 +8,7 @@
 | 项目 | **ZCode-AgentFlow** — ZCode 主控的 AgentFlow：ZCode(GLM-5.2) Supervisor+Executor、Codex(GPT) Planner、Grok(Grok-4.5) Reviewer，三者以版本化文件 + JSON Schema 交接 |
 | 实现语言 | Python（src-layout 包 `zcode_agentflow`） |
 | 部署形态 | 用户级插件，运行时 `target_repo` 传入，**不绑定特定业务仓库** |
-| 当前阶段 | **Phase 0（能力探测）已完成**；`docs/capabilities.json` + `requirements.lock` 已提交，外部接口契约已用真实证据固化。Phase 1+ 实现待执行。 |
+| 当前阶段 | **v1 已实现并通过测试**（Phase 0–8 全部完成）。`src/zcode_agentflow/` 生产源码、9-tool MCP server、状态机、Codex/Grok adapters、hooks 均已落地；默认测试套件全绿。外部接口契约以 `docs/capabilities.json` 真实证据为准（mcp SDK 已升级到 1.29.0）。 |
 | 主目标平台 | Windows / Git Bash |
 | 人工门（v1） | SPEC 批准 + 最终合并（两道）；其余 FAIL/未授权/超限 → `NEEDS_HUMAN` |
 | 终态（v1） | `READY_TO_MERGE`（合并在 AgentFlow 外手工完成，v1 不做合并动作） |
@@ -17,14 +17,14 @@
 
 ## 1. 当前仓库状态（务必先认清，避免假设不存在的东西）
 
-- **Phase 0 已完成**：`docs/capabilities.json`（外部接口契约的唯一事实来源，见 §5）+
-  `requirements.lock`（P1-7 锁定版本）已提交（5 个 `spike:` commit）。外部接口
-  （ZCode MCP/Hook、Codex、Grok）已用真实运行证据固化，**不再靠猜测**。
-- **尚无 production 源码**：`src/zcode_agentflow/`（包）、`pyproject.toml`、`config.yaml`
-  等属于 Phase 1+ 产物。不要假设它们已存在或可 import。（工作区可能出现 Phase 1 的
-  untracked 文件——以实际 `git status` 为准，Phase 0 的 5 个 commit 只含 capabilities/
-  lock/.gitignore 三个文件。）
-- **仓库含文档 + Phase 0 探测结论**：`docs/` 下 Specs / Plan / Review / 分阶段执行 Prompt；
+- **v1 已实现并通过测试**：`src/zcode_agentflow/` 生产源码（engine / store / gitops /
+  server / adapters 等）、`pyproject.toml`、`config.yaml`、9-tool MCP server、状态机
+  （NEW → READY_TO_MERGE）、Codex/Grok adapters、两个 hooks 均已落地。默认测试套件
+  全绿（`python -m pytest -q`）。
+- **外部接口契约已固化并升级**：`docs/capabilities.json`（外部接口的唯一事实来源，
+  见 §5）+ `requirements.lock`（已 OSV 全量重扫，39 个包零公告，mcp SDK 1.29.0）。
+  外部接口（ZCode MCP/Hook、Codex、Grok）以真实运行证据为准。
+- **仓库含文档 + 实现源码**：`docs/` 下 Specs / Plan / Review / 分阶段执行 Prompt；
   `docs/capabilities.json` + `requirements.lock` 是 Phase 0 产物。
 - **执行入口**：通过 `docs/prompts/zcode-agentflow-execution-prompts-v1/` 的分阶段 Prompt
   逐 Phase 执行（见 §2、§3）。Phase 0 已过，下一入口是 Phase 1。
@@ -99,7 +99,7 @@ ZCode / Codex CLI / Grok CLI / MCP SDK 的真实 flag、字段、payload、退�
 | G4 | **MCP stdout 是协议通道** | FastMCP stdio 下任何 `print()` / `logging` 到 stdout / 子进程 stdout 直通 / traceback 都会破坏 framing。日志走 stderr，子进程 stdout 必须 capture。 |
 | G5 | **Codex stdin / cwd / 输出分离** | Codex 的 prompt 经 stdin 输入、`cwd=repo`、read-only 生效、schema 输出写到独立 operation 目录；不要把 prompt 拼进命令行或让 cwd 指向 control_root。 |
 | G6 | **诚实降级** | 批准机制：`allow_non_adversarial_fallback: false`（默认）→ 不支持工具级强制确认时**启动失败**而非静默降级；`true` 才降级并明确提示保障等级降低。威胁模型：MCP 只提供**流程完整性**，不防同权限恶意进程篡改。 |
-| G7 | **Grok 子进程必须显式注入代理**（Phase 0 实测） | Grok CLI（Rust/reqwest）走**标准系统代理环境变量** `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`，但 grok **不会读取 `~/.grok/.env`**（它不是 codex；grok 的 Config Sources 只有 `config.toml` + OS 环境变量）。本机网络需经 Clash Verge（`127.0.0.1:7897`）出网，因此 **Phase 4 `GrokAdapter` 启动子进程时必须在 `env` 里显式传这些代理变量**，否则调用会无限挂起。codex 不受影响（`~/.codex/.env` 自动注入）。注意 grok 的 `proxy_endpoint`/`GROK_WEB_FETCH_PROXY`/`GROK_CLI_CHAT_PROXY_BASE_URL` 是**应用层 API 网关代理**，不是系统网络代理，不能用它们解决出网。 |
+| G7 | **Grok 子进程必须显式注入代理**（Phase 0 实测） | Grok CLI（Rust/reqwest）走**标准系统代理环境变量** `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`，但 grok **不会读取 `~/.grok/.env`**（它不是 codex；grok 的 Config Sources 只有 `config.toml` + OS 环境变量）。**需要出网代理的环境**（如内网经 Clash Verge 等本地代理），**Phase 4 `GrokAdapter` 启动子进程时必须在 `env` 里显式传这些代理变量**，否则调用会无限挂起；代理值来自用户在 `config.yaml` 的 `reviewer.proxy` 配置（**不随发布硬编码任何固定地址**）。codex 不受影响（`~/.codex/.env` 自动注入）。注意 grok 的 `proxy_endpoint`/`GROK_WEB_FETCH_PROXY`/`GROK_CLI_CHAT_PROXY_BASE_URL` 是**应用层 API 网关代理**，不是系统网络代理，不能用它们解决出网。 |
 | G8 | **Grok `--cwd` 必须是绝对 Windows 路径；`--json-schema` 只接内联 JSON**（Phase 0 实测） | `grok -p` 的 `--cwd` 给相对路径会直接报 `Error: 系统找不到指定的文件。 (os error 2)`；Adapter 须传绝对路径（如 `C:\...\bundle`）。`--json-schema` 接收**内联 JSON 字符串**，**不支持 `@file` 语法**（`--json-schema @schema.json` → `invalid JSON` 报错）；正确写法 `--json-schema "$(cat schema.json)"`。结构化结果在 stdout envelope 的 `structuredOutput` 字段（已解析对象），权威于 `text` 字段里的 JSON。 |
 | G9 | **ZCode hook stdin 是双键结构；工具确认非 GUI 开关**（Phase 0 实测） | ZCode 7 个 hook 事件的 stdin **同时提供 snake_case + camelCase 两份键**（`hook_event_name`/`hookEventName`、`tool_name`/`toolName`、`tool_input`/`toolInput`…），解析时任取其一即可。`PreToolUse` 还带 ZCode 自动算的 `riskLevel` + `sideEffectScope`。**工具确认不是 GUI 开关**，而是 `~/.claude/settings.json` 的 `permissions.defaultMode`（GUI 显示"完全访问/变更前确认"，内部值 `yolo`/非yolo）+ `allow`/`deny` 规则（如 `Bash(awk:*)`）。`PermissionRequest` 事件在 `yolo` 模式下**不触发**；要让它触发须切到非 yolo。 |
 | G10 | **ZCode 主会话 hook runner 与 exec 子会话分离**（Phase 0 实测，探测教训） | ZCode 的 hook runner 跑在**交互主会话**；而 Agent 执行 Bash 工具的子进程是 **exec 子会话**（`~/.zcode/cli/exec/sess_<id>/`），**没有 hook runner**——从 exec 子会话里跑命令不会产生任何 hook 日志，也无法触发主会话的 `PermissionRequest`。探测/验证 hook 行为时，必须在主会话内闭环，不能指望 exec 子会话观察到 hook。Phase 7 写生产 hook 时同理：hook 的执行主体是 ZCode 主进程，不是 Adapter 的子进程。 |

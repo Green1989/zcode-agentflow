@@ -27,8 +27,21 @@ See `docs/review/2026-07-31-phase7-8-audit-fix-notes.md` and Plan v2.2 errata 9�
 
 ```text
 $ python -m pytest -q
-560 passed in ~136s
 ```
+
+The test count grows as tests are added; the current count is reported in the
+re-validation record below. Historical snapshots (for traceability):
+
+- **2026-07-31 (audit-fix R2):** 560 passed in ~136s (0 xfailed).
+- **2026-08-11 (release hardening, FINAL — mcp 1.29.0):** 605 passed in ~155s
+  (local env, `mcp 1.29.0` zero-advisory + refreshed transitives, 0 xfailed,
+  1 benign upstream `pydantic-settings` IncompleteFieldDefinitionWarning). The
+  additional tests over the R2 baseline are the release-hardening guards
+  (`tests/unit/test_license_metadata.py`,
+  `tests/unit/test_release_portability.py` incl. the Unicode-path regression,
+  `tests/unit/test_dependency_security.py` incl. the live-OSV all-package scan,
+  `tests/unit/test_ci_config.py`). The authoritative count is whatever
+  `python -m pytest -q` reports; the figure here is a dated snapshot.
 
 `tests/smoke` is NOT collected (`pyproject.toml addopts = ["--ignore=tests/smoke"]`).
 (0 xfailed — the R1 strict-mode schema blocker that was previously xfailed is now
@@ -74,11 +87,15 @@ reviewer_review_task, workflow_complete_task
 | **2** MCP stdio E2E | the same run over the **real MCP protocol** (real server subprocess + official SDK client), never calling the Engine directly. Process A starts the run, is torn down, a fresh process B resumes it via the active-run pointer + `Store.recover`, completes to READY_TO_MERGE, and a third fresh process observes READY_TO_MERGE via `workflow_status`. Now ALSO replays the CAS-mismatch rejection over the transport. | `python -m pytest tests/e2e/test_mcp_transport_e2e.py -v` | **3 passed** |
 | **3** Real-CLI smoke | a documented, manually-run smoke against the **real** `codex exec` / `grok -p`. OFF by default; gated on `AGENTFLOW_SMOKE=1` + capability check. The approval mode is derived from the REAL capability gate (never injected). | `AGENTFLOW_SMOKE=1 python tests/smoke/run_local_smoke.py` (manual) | **PARTIAL — see below** |
 
-### Layer 3 — honest status (post round-2 audit-fix)
+### Layer 3 — honest status (post round-3)
 
 Running the real smoke surfaced **four** production blockers across two rounds.
-All four are now FIXED in code (verified locally); the full model run is blocked
-only by a transient codex↔ChatGPT network issue, not by any code/schema defect.
+All four are now FIXED in code (verified locally). After round 3 (network
+restored) the full READY_TO_MERGE run is **not** blocked by any code/schema
+defect or by a network issue — it is gated by **smoke-harness determinism**:
+codex is non-deterministic and writes a different verification program each
+run, which the stand-in executor cannot always satisfy. See the round-3
+section below for the precise status of each step.
 
 1. **Windows spawn (R1)** — `run_subprocess` with `shell=False` could not launch
    the npm-installed `codex` (a `.cmd` shim) → `FileNotFoundError [WinError 2]`.
@@ -134,7 +151,9 @@ handles `target='X'` and `== 'X'` forms) and falls back honestly otherwise.
 either (a) a smoke executor that applies codex's plan via a real codex executor
 step (a future enhancement, more tokens), or (b) the run happening to produce a
 verification the harness can satisfy.** Every code/schema/adapter defect is fixed
-and unit-tested (564 passed, 0 xfailed); the real Codex draft/plan/verify paths
+and unit-tested (564 passed at that time, 0 xfailed; the count as of the
+2026-08-11 release-hardening re-validation is 605 — see the Verification section
+above); the real Codex draft/plan/verify paths
 and real Grok reachability are all proven individually. This is an honest PARTIAL
 (harness-determinism-limited), not a fabricated pass — and notably the engine's
 verification gate is proven to work correctly in BOTH outcomes.

@@ -3,12 +3,13 @@
 These tests pin the packaging to the REAL Phase-0 findings. The decisive fact
 (docs/capabilities.json → gates.tool_confirmation): tool_confirmation is
 ``value:false, class:fallback-capable`` — i.e. ZCode *supports* tool-level
-confirmation but it is NOT *configured* in this environment (defaultMode=yolo/
-bypassPermissions), and the mechanism is ``permissions.defaultMode`` + allow/deny
-rules in ``~/.claude/settings.json`` (NOT a per-tool field in a plugin
-manifest). Therefore the manifest MUST NOT fabricate a per-tool confirmation
-switch; per the plan's own [DATA] note, the fallback path is documented instead
-and a ``security_warning`` is surfaced (ties to Task 5.1/1.4 / approval.py).
+confirmation but whether it is *configured* depends on each operator's
+``permissions.defaultMode`` + allow/deny rules in ``~/.claude/settings.json``
+(the Phase-0 spike env ran defaultMode=yolo where it was NOT enforced; your env
+may differ) (NOT a per-tool field in a plugin manifest). Therefore the manifest
+MUST NOT fabricate a per-tool confirmation switch; per the plan's own [DATA]
+note, the fallback path is documented instead and a ``security_warning`` is
+surfaced (ties to Task 5.1/1.4 / approval.py).
 """
 
 from __future__ import annotations
@@ -115,7 +116,8 @@ def test_manifest_configures_confirmation_for_approve_spec_only():
         "supported must be False — capabilities.json gates.tool_confirmation.value=false"
     )
     assert tc.get("configured") is False, (
-        "configured must be False — defaultMode=yolo; supported ≠ configured (P1-1)"
+        "configured must be False — confirmation is per-operator and not assumed "
+        "configured by default; supported ≠ configured (P1-1)"
     )
     assert tc.get("fallback") == "non_adversarial_convention", (
         "fallback must be the spike-confirmed non_adversarial_convention"

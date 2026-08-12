@@ -1,0 +1,70 @@
+# CI — test suite on Windows (primary platform) + Ubuntu (best-effort).
+#
+# The install follows the lock-driven contract (requirements.lock first, then
+# the package with --no-deps) so the validated dependency versions are exactly
+# what CI tests. Only the DEFAULT pytest suite runs here: the real-CLI smoke
+# (tests/smoke) spends model tokens and needs codex/grok login, so it stays a
+# manual, operator-run check (pyproject addopts ignores it by default).
+#
+# All third-party actions are pinned to full commit SHAs (not floating tags) to
+# defend against a compromised maintainer repointing a tag.
+
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test-windows:
+    name: pytest (windows-latest, python ${{ matrix.python-version }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 = declared minimum; 3.13 = the validated spike version.
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies (lock-driven)
+        # requirements.lock pins every version; --no-deps prevents drift past
+        # the validated freeze. This is the same install the project documents.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.lock
+          python -m pip install -e . --no-deps
+      - name: Run default test suite
+        run: python -m pytest -q
+
+  test-linux:
+    # Linux is best-effort: the project's primary platform is Windows
+    # (AGENTS.md). If the Linux run reveals a real platform bug, fix it; if it
+    # only fails on a Windows-specific path, the failure is honest and tracked.
+    name: pytest (ubuntu-latest, python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies (lock-driven)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.lock
+          python -m pip install -e . --no-deps
+      - name: Run default test suite
+        run: python -m pytest -q

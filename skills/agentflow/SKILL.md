@@ -54,13 +54,15 @@ mismatch means another call advanced the state; re-read `workflow_status`.
 - **Gate 2 — final merge** (`workflow_complete_task` → `READY_TO_MERGE`): the
   run stops at `READY_TO_MERGE`; the user decides push/PR/merge externally.
 
-### Gate 1 confirmation is REDUCED in this environment (security warning)
+### Gate 1 confirmation may be REDUCED (security warning)
 
 `workflow_approve_spec` is an ordinary MCP tool, so the approval uses
 **process-integrity** assurance, not a cryptographic guarantee. Per the Phase-0
 findings (`docs/capabilities.json`), ZCode **supports** tool-level mandatory
-confirmation but it is **NOT configured** here (`permissions.defaultMode = yolo`
-in `~/.claude/settings.json`). Therefore the approval runs the
+confirmation, but whether it is **configured** depends on your own
+`~/.claude/settings.json` (`permissions.defaultMode`). If your environment does
+NOT enforce confirmation (e.g. it runs `defaultMode = yolo`/`bypassPermissions`,
+as the Phase-0 spike env did), the approval runs the
 **non-adversarial convention** fallback:
 
 > Security assurance is REDUCED: ZCode tool-level mandatory confirmation is not

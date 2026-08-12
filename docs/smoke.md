@@ -27,11 +27,13 @@ login state.
   `docs/capabilities.json` `codex.auth`.
 - **grok** installed and logged in (xAI account) — see `docs/capabilities.json`
   `grok.auth`.
-- **Local proxy reachable** for grok. Grok has **no** automatic proxy injection
-  (unlike codex's `~/.codex/.env`), so the harness passes
-  `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` explicitly in the subprocess env
-  (capability gates G7/G8). Default: `http://127.0.0.1:7897` (Clash Verge);
-  override with `AGENTFLOW_PROXY`.
+- **Local proxy reachable** for grok (if your network requires one). Grok has
+  **no** automatic proxy injection (unlike codex's `~/.codex/.env`), so the
+  harness passes `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` explicitly in the
+  subprocess env (capability gates G7/G8). There is **no shipped default**;
+  set `AGENTFLOW_PROXY` to YOUR local proxy address (e.g.
+  `http://127.0.0.1:7890` for a typical local proxy setup). If your network
+  reaches xAI directly, leave it unset.
 - Python deps installed:
   `pip install -r requirements.lock && pip install -e . --no-deps`.
 
@@ -46,7 +48,7 @@ AGENTFLOW_SMOKE=1 python tests/smoke/run_local_smoke.py
 Optional overrides:
 
 ```bash
-AGENTFLOW_SMOKE=1 AGENTFLOW_PROXY=http://127.0.0.1:7897 \
+AGENTFLOW_SMOKE=1 AGENTFLOW_PROXY=http://YOUR-LOCAL-PROXY:PORT \
   python tests/smoke/run_local_smoke.py
 ```
 

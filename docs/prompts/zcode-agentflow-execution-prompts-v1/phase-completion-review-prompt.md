@@ -4,8 +4,8 @@
 
 ## 权威依据
 
-- Plan：`D:\ZCode\zcode-agentflow\docs\superpowers\plans\2026-07-30-zcode-agentflow-v1-v2-2.md` 的 Execution Errata、对应 Phase Entry/Exit、全部 Task。
-- Specs：`D:\ZCode\zcode-agentflow\docs\superpowers\specs\2026-07-29-zcode-agentflow-design.md`。
+- Plan：`<repo-root>\docs\superpowers\plans\2026-07-30-zcode-agentflow-v1-v2-2.md` 的 Execution Errata、对应 Phase Entry/Exit、全部 Task。
+- Specs：`<repo-root>\docs\superpowers\specs\2026-07-29-zcode-agentflow-design.md`。
 - 被审范围：执行 Agent 报告的该 Phase commits，以及其相对于 Phase开始commit的 diff。
 
 ## 审查步骤

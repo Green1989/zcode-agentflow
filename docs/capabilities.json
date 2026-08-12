@@ -8,18 +8,18 @@
 
   "versions": {
     "python": "3.13.2",
-    "mcp_sdk": "1.8.1",
+    "mcp_sdk": "1.29.0",
     "mcp_sdk_import_path": "mcp.server.fastmcp.FastMCP",
     "mcp_protocol_version": "2024-11-05",
     "portalocker": "2.10.1",
     "jsonschema": "4.26.0",
     "pyyaml": "6.0.2",
-    "pytest": "9.0.2",
+    "pytest": "9.1.1",
     "codex_cli": "0.146.0",
     "grok_cli": "0.2.114",
     "git": "2.44.0.windows.1",
     "zcode": "3.5.3.3911",
-    "_note": "portalocker/pytest-mock were installed during the spike (not pre-installed); mcp SDK is the OFFICIAL 'mcp' package under site-packages, not a local dir."
+    "_note": "portalocker/pytest-mock were installed during the spike (not pre-installed); mcp SDK is the OFFICIAL 'mcp' package under site-packages, not a local dir. mcp upgraded 1.8.1 -> 1.29.0 and transitive deps refreshed on 2026-08-11 after an OSV security re-scan that returned ZERO advisories for every locked package (all 39) at these versions; the FastMCP stdio contract was re-verified (import path, @mcp.tool() registration, stdio server entry point) in a clean venv, and the full default suite passes (605 at last run; the authoritative count is the live `python -m pytest -q` result)."
   },
 
   "zcode": {
@@ -116,7 +116,7 @@
     "_summary": "Codex CLI (codex exec) contract for the Planner adapter — confirmed via Task 0.3 on a tiny sample git repo.",
     "command": "codex exec",
     "cli_version": "0.146.0",
-    "auth": "Logged in via ChatGPT (~/.codex). A ~/.codex/.env file injects proxy env vars (HTTP(S)_PROXY/ALL_PROXY=127.0.0.1:7897) automatically — codex does NOT need the Adapter to pass proxy explicitly.",
+    "auth": "Logged in via ChatGPT (~/.codex). A ~/.codex/.env file injects proxy env vars (HTTP(S)_PROXY/ALL_PROXY=<the operator's local proxy>) automatically — codex does NOT need the Adapter to pass proxy explicitly.",
     "stdin_prompt_works": {
       "value": true,
       "evidence": "prompt piped to stdin (`cat prompt.txt | codex exec ...`); codex reads prompt from stdin when no positional PROMPT arg (or `-`) is given. Piped stdin is appended as a <stdin> block when a prompt arg is also present.",
@@ -193,7 +193,7 @@
     },
     "network_requires_proxy": {
       "value": true,
-      "_critical": "Grok has NO automatic proxy injection (unlike codex's ~/.codex/.env). The Adapter MUST explicitly pass HTTP_PROXY/HTTPS_PROXY/ALL_PROXY=http://127.0.0.1:7897 in the subprocess env, otherwise the call HANGS indefinitely (network unreachable). This is a HARD contract for Phase 4 GrokAdapter."
+      "_critical": "Grok has NO automatic proxy injection (unlike codex's ~/.codex/.env). The Adapter MUST explicitly pass HTTP_PROXY/HTTPS_PROXY/ALL_PROXY=<the operator's proxy> in the subprocess env (sourced from config.yaml reviewer.proxy), otherwise the call HANGS indefinitely (network unreachable). This is a HARD contract for Phase 4 GrokAdapter."
     },
     "working_flags": ["-p \"<prompt>\"", "--cwd \"<absolute win path>\"", "--json-schema \"<inline json>\"", "--output-format json", "--permission-mode plan", "--always-approve"]
   },
@@ -214,7 +214,7 @@
       "value": false,
       "class": "fallback-capable",
       "fallback": "non_adversarial_convention",
-      "evidence": "zcode.tool_confirmation.supported=true BUT configured as defaultMode=yolo/bypassPermissions in this env, so MCP-level mandatory confirmation is NOT enforced. The fallback is the convention-based approval flow (workflow_approve_spec gate node).",
+      "evidence": "zcode.tool_confirmation.supported=true. Whether it is configured depends on the operator's ~/.claude/settings.json (permissions.defaultMode). The Phase-0 spike env ran defaultMode=yolo/bypassPermissions, so MCP-level mandatory confirmation was NOT enforced there; other environments may differ. The fallback is the convention-based approval flow (workflow_approve_spec gate node).",
       "_config_key": "human_gates.spec_approval.allow_non_adversarial_fallback"
     },
     "reasoning_effort_high": {
@@ -244,7 +244,7 @@
     "proxy_required_for_external_llm": {
       "value": true,
       "class": "required",
-      "evidence": "grok hangs without explicit proxy env (HTTP(S)_PROXY=127.0.0.1:7897); codex injects its own via ~/.codex/.env. The Phase 4 adapters MUST pass proxy env to grok subprocess; codex works either way.",
+      "evidence": "grok hangs without explicit proxy env (HTTP(S)_PROXY=<operator proxy>); codex injects its own via ~/.codex/.env. The Phase 4 adapters MUST pass proxy env to grok subprocess (sourced from config); codex works either way.",
       "_note": "This is an environment finding, not a product feature. Documented so the Adapter does not assume env inheritance."
     }
   },

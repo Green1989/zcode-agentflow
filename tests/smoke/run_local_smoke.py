@@ -16,12 +16,13 @@ run — something fakes can never prove.
 HONESTY (P0-5 audit-fix, Plan erratum 13): the approval mode is derived from the
 REAL capability gate (:func:`_resolve_effective_config` →
 ``validate_capabilities``), NEVER injected. ``tool_confirmation`` is SUPPORTED
-but NOT configured in this env (defaultMode=yolo), so the run uses the
+but whether it is CONFIGURED depends on the operator's ``~/.claude/settings.json``
+(``permissions.defaultMode``). When it is not enforced the run uses the
 ``non_adversarial_convention`` fallback with the canonical security_warning.
-``confirmation_configured`` is therefore False in the handoff. This harness
-cannot observe the ZCode GUI confirmation dialog — the two human gates remain
-the operator's to verify. It does NOT claim a strong confirmation it did not
-observe.
+``confirmation_configured`` is therefore False in the handoff unless the harness
+can observe a real prompt (it cannot observe the ZCode GUI confirmation dialog).
+The two human gates remain the operator's to verify. It does NOT claim a strong
+confirmation it did not observe.
 
 Usage (manual, from the repo root):
 
@@ -31,10 +32,10 @@ Exit code 0 == the run reached READY_TO_MERGE; non-zero == it stopped at a safe
 state (NEEDS_HUMAN / a real CLI error / a missing capability). Failures are
 reported honestly — the harness never swaps real CLIs for fakes to "pass".
 
-Requires: codex logged in (``~/.codex``), grok logged in, and the local proxy
-(Clash Verge ``127.0.0.1:7897``) reachable for grok (G7/G8). The run stops at
-READY_TO_MERGE (no merge/push); the SPEC approval is recorded with the resolved
-(honest) approval method.
+Requires: codex logged in (``~/.codex``), grok logged in, and (if your network
+needs one) a local proxy reachable for grok set via ``AGENTFLOW_PROXY`` (G7/G8).
+The run stops at READY_TO_MERGE (no merge/push); the SPEC approval is recorded
+with the resolved (honest) approval method.
 """
 
 from __future__ import annotations
@@ -63,8 +64,10 @@ from zcode_agentflow import (  # noqa: E402  (sys.path set above on purpose)
 from zcode_agentflow.adapters.codex import CodexAdapter  # noqa: E402
 from zcode_agentflow.adapters.grok import GrokAdapter  # noqa: E402
 
-# The local proxy grok MUST reach to get off the machine (G7). Override via env.
-DEFAULT_PROXY = "http://127.0.0.1:7897"
+# Grok needs an explicit proxy to reach xAI when the host network requires one
+# (G7). There is NO shipped default — operators set AGENTFLOW_PROXY to their OWN
+# local proxy address. None means "no proxy; assume direct network reach."
+DEFAULT_PROXY = None
 RUN_ID = "20260731120000-5e0ea1"  # 14 digits + 6 hex (ids.validate_run_id)
 
 # set by run_smoke() so the __main__ error handler can dump the last adapter's
@@ -147,12 +150,12 @@ def _resolve_effective_config(cfg: dict) -> dict:
     (`bootstrap.process_config()` → `validate_capabilities`). It MUST NOT inject
     `confirmation_configured=True` (P0-5 audit-fix): tool-level confirmation is
     only "configured" when `~/.claude/settings.json` actually prompts on the
-    `workflow_approve_spec` MCP tool, which this harness cannot observe. The
-    spike found `tool_confirmation` SUPPORTED but not configured in this env
-    (defaultMode=yolo), so the gate resolves to the `non_adversarial_convention`
-    fallback (with the canonical security_warning) — unless the operator opts
-    into the fallback via config, in which case `allow_non_adversarial_fallback`
-    must be true or the gate fails loud (G6)."""
+    `workflow_approve_spec` MCP tool, which this harness cannot observe. When
+    tool-level confirmation is not enforced (as in the Phase-0 spike env), the
+    gate resolves to the `non_adversarial_convention` fallback (with the
+    canonical security_warning) — unless the operator opts into the fallback via
+    config, in which case `allow_non_adversarial_fallback` must be true or the
+    gate fails loud (G6)."""
     from zcode_agentflow.config import validate_capabilities
     caps_path = REPO_ROOT / "docs" / "capabilities.json"
     findings = json.loads(caps_path.read_text(encoding="utf-8"))["gates"]
@@ -185,12 +188,14 @@ def _build_engine(control: Path, worktree: Path, repo: Path, plugin: Path,
         "planner": {"timeout_sec": 600},
         "reviewer": {
             "timeout_sec": 300,
-            # grok MUST receive these explicitly (G7/G8) or it hangs.
+            # grok needs an explicit proxy when the host network requires one
+            # (G7/G8). None => no proxy injected (direct network). The adapter
+            # skips empty/None values, so this is safe either way.
             "proxy": {"HTTP_PROXY": proxy, "HTTPS_PROXY": proxy, "ALL_PROXY": proxy},
         },
         # The spec-approval gate is part of human_gates; this harness accepts the
-        # non-adversarial fallback (tool_confirmation is NOT configured in this
-        # env) so the run can proceed with the documented reduced assurance.
+        # non-adversarial fallback (when tool_confirmation is not enforced in
+        # this env) so the run can proceed with the documented reduced assurance.
         "human_gates": {
             "spec_approval": {
                 "required": True,

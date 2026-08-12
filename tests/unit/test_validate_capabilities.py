@@ -154,14 +154,15 @@ def test_validate_against_real_config_and_findings():
     """The REAL production config.yaml + the REAL docs/capabilities.json findings.
 
     Real environment (capabilities.json): tool_confirmation is value=false
-    (the env runs yolo/bypass — MCP-level mandatory confirmation is NOT enforced),
+    (the Phase-0 spike env ran defaultMode=yolo/bypass — MCP-level mandatory
+    confirmation was NOT enforced there; other envs may differ),
     class=fallback-capable, fallback=non_adversarial_convention. R2-3 (P0-3):
     the committed config.yaml ships allow_non_adversarial_fallback=true
-    (capabilities tool_confirmation is value:false in this env, defaultMode=yolo),
-    so validate_capabilities RESOLVES to the non_adversarial_convention fallback
-    (not raise) — the server can start, with the canonical security_warning
-    surfaced (approval.py / plugin.json). This is the documented reduced-assurance
-    state for an env where tool-level confirmation is not configured.
+    (capabilities tool_confirmation is value:false), so validate_capabilities
+    RESOLVES to the non_adversarial_convention fallback (not raise) — the server
+    can start, with the canonical security_warning surfaced (approval.py /
+    plugin.json). This is the documented reduced-assurance state for an env where
+    tool-level confirmation is not configured.
 
     If the committed config flips back to false, this assertion must flip to
     expecting CapabilityError (G6 fail-loud) — update it deliberately.

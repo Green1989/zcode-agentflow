@@ -63,12 +63,15 @@ reviewer:
   # The grok adapter (adapters/grok.py) reads reviewer.proxy and injects these
   # into the subprocess env. Without this, grok HANGS indefinitely (network
   # unreachable) and the review times out at 300s -> FAILED -> NEEDS_HUMAN.
-  # This is the AUTHORITATIVE proxy config for the reviewer; do not rely on
-  # plugin.json env inheritance (fragile across reinstalls).
-  proxy:
-    HTTPS_PROXY: http://127.0.0.1:7897
-    HTTP_PROXY: http://127.0.0.1:7897
-    ALL_PROXY: http://127.0.0.1:7897
+  #
+  # PORTABILITY: no proxy is shipped by default. Operators behind a local proxy
+  # (e.g. Clash Verge) MUST set reviewer.proxy here with their OWN address.
+  # Example (commented out — uncomment and replace with YOUR proxy host:port):
+  #
+  # proxy:
+  #   HTTPS_PROXY: http://127.0.0.1:YOUR-PORT
+  #   HTTP_PROXY:  http://127.0.0.1:YOUR-PORT
+  #   ALL_PROXY:   http://127.0.0.1:YOUR-PORT
 
 verification:                   # layer 1: verification command policy
   command_policy:

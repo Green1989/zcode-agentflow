@@ -9,7 +9,7 @@
 #     pip install -r requirements.lock && pip install -e . --no-deps
 
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -18,16 +18,37 @@ version = "0.1.0"
 description = "ZCode-supervised AgentFlow: Codex planner + Grok reviewer, versioned-file handoff"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
-authors = [{ name = "ZCode-AgentFlow" }]
-# Compatible-release bounds anchored to the Phase 0 spike versions.
+license = "MIT"
+authors = [{ name = "ZCode-AgentFlow contributors" }]
+# Compatible-release bounds anchored to the validated + security-scanned versions.
 # EXACT versions live in requirements.lock (the frozen contract).
 dependencies = [
-    "mcp~=1.8",
+    "mcp>=1.29,<2",
     "portalocker~=2.10",
     "jsonschema>=4.21",
     "PyYAML>=6.0",
 ]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Software Development :: Version Control :: Git",
+]
+
+# Public project URLs. This project ships as a ZCode plugin installed from a
+# Git clone + local marketplace (see README); it is NOT published on PyPI, so
+# no PyPI URLs are listed.
+[project.urls]
+Homepage = "https://github.com/Green1989/zcode-agentflow"
+Repository = "https://github.com/Green1989/zcode-agentflow"
+Documentation = "https://github.com/Green1989/zcode-agentflow/tree/main/docs"
+Issues = "https://github.com/Green1989/zcode-agentflow/issues"
 
 [project.optional-dependencies]
 test = [

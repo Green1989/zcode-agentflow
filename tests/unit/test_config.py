@@ -46,10 +46,11 @@ def test_load_valid_config():
     # human_gates
     hg = cfg["human_gates"]["spec_approval"]
     assert hg["required"] is True
-    # R2-3/P0-3: shipped true (capabilities tool_confirmation is value:false in
-    # this env, defaultMode=yolo). true => the server STARTS in the
-    # non_adversarial_convention fallback with the canonical security_warning
-    # surfaced (approval.py). See config.yaml comment + plugin.json toolConfirmation.
+    # R2-3/P0-3: shipped true (capabilities tool_confirmation is value:false —
+    # confirmation may not be enforced in every operator's env). true => the
+    # server STARTS in the non_adversarial_convention fallback with the canonical
+    # security_warning surfaced (approval.py) when confirmation is not enforced.
+    # See config.yaml comment + plugin.json toolConfirmation.
     assert hg["allow_non_adversarial_fallback"] is True
     # planner / reviewer present with a command
     assert cfg["planner"]["command"] == "codex"

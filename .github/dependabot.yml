@@ -1,0 +1,27 @@
+# Dependabot — track dependency + GitHub Actions updates.
+#
+# pip watches requirements.lock (the version freeze). github-actions watches the
+# workflow files. Both open PRs when an update is available; a maintainer
+# reviews + re-validates before merging (a dependency bump is a contract change
+# that must be re-spiked, not auto-merged).
+
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    # requirements.lock pins exact versions; allow Dependabot to update them.
+    # A bump here is a validated-contract change (re-run the OSV scan + the
+    # FastMCP stdio probe before merging).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "github-actions"

@@ -42,6 +42,12 @@ FAKE_GROK = str(Path(__file__).parent / "_fakes" / "fake_grok.py")
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCHEMAS_DIR = REPO_ROOT / "schemas"
 
+# A synthetic proxy value for fixture use. Deliberately NOT a real operator
+# address (port 1 is discarded; this is a placeholder so no machine-specific
+# value ships in the repo). The adapter injects whatever proxy the request
+# carries (G7); the value itself is opaque to the logic under test.
+TEST_PROXY = "http://test-proxy.invalid:1"
+
 
 # ---------------------------------------------------------------------------
 # helpers: a fake git repo + a fake ArtifactResolver + bundle assembly args
@@ -140,9 +146,9 @@ def _assemble_and_run(tmp_path: Path, *, timeout: int = 30, fail_grok: bool = Fa
         "schema_path": str(SCHEMAS_DIR / "review-decision.schema.json"),
         "model": "grok-4.5",
         "sandbox": "read-only",
-        "proxy": {"HTTPS_PROXY": "http://127.0.0.1:7897",
-                  "HTTP_PROXY": "http://127.0.0.1:7897",
-                  "ALL_PROXY": "http://127.0.0.1:7897"},
+        "proxy": {"HTTPS_PROXY": TEST_PROXY,
+                  "HTTP_PROXY": TEST_PROXY,
+                  "ALL_PROXY": TEST_PROXY},
     }
     if monkeypatch is not None and fail_grok:
         monkeypatch.setenv("FAKE_GROK_DECISION", "FAIL")
@@ -291,7 +297,7 @@ def test_dirty_repo_at_call_time_raises(tmp_path: Path):
         "repo_root": str(repo),
         "schema_path": str(SCHEMAS_DIR / "review-decision.schema.json"),
         "model": "grok-4.5", "sandbox": "read-only",
-        "proxy": {"HTTPS_PROXY": "http://127.0.0.1:7897"},
+        "proxy": {"HTTPS_PROXY": TEST_PROXY},
     }
     with pytest.raises(GrokAdapterError) as exc_info:
         adapter.invoke(request=request, repo_cwd=repo, operation_dir=op_dir, timeout=30)
@@ -353,7 +359,7 @@ def test_invalid_raw_review_rejected(tmp_path: Path, monkeypatch):
         "repo_root": str(repo),
         "schema_path": str(SCHEMAS_DIR / "review-decision.schema.json"),
         "model": "grok-4.5", "sandbox": "read-only",
-        "proxy": {"HTTPS_PROXY": "http://127.0.0.1:7897"},
+        "proxy": {"HTTPS_PROXY": TEST_PROXY},
     }
     with pytest.raises(GrokAdapterError):
         adapter.invoke(request=request, repo_cwd=repo, operation_dir=op_dir, timeout=30)
@@ -376,7 +382,7 @@ def test_grok_timeout_kills_process_tree(tmp_path: Path, monkeypatch):
         "repo_root": str(repo),
         "schema_path": str(SCHEMAS_DIR / "review-decision.schema.json"),
         "model": "grok-4.5", "sandbox": "read-only",
-        "proxy": {"HTTPS_PROXY": "http://127.0.0.1:7897"},
+        "proxy": {"HTTPS_PROXY": TEST_PROXY},
     }
     import time
     start = time.perf_counter()
