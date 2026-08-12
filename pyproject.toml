@@ -24,7 +24,7 @@ authors = [{ name = "ZCode-AgentFlow contributors" }]
 # EXACT versions live in requirements.lock (the frozen contract).
 dependencies = [
     "mcp>=1.29,<2",
-    "portalocker~=2.10",
+    "portalocker>=2.10,<5.0",
     "jsonschema>=4.21",
     "PyYAML>=6.0",
 ]
